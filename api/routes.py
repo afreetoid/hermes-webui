@@ -3704,7 +3704,7 @@ def handle_get(handler, parsed) -> bool:
             else:
                 if is_messaging_session and cli_messages:
                     sidecar_messages = getattr(s, "messages", []) or []
-                    _all_msgs = merge_session_messages_append_only(sidecar_messages, cli_messages)
+                    _all_msgs = merge_session_messages_append_only(cli_messages, sidecar_messages)
                 else:
                     _all_msgs = merge_session_messages_append_only(getattr(s, "messages", []) or [], state_db_messages)
             if load_messages:

@@ -2400,9 +2400,12 @@ def merge_session_messages_append_only(sidecar_messages: list, state_messages: l
         merged_messages.append(msg)
     for msg in state_messages:
         timestamp = _message_timestamp_as_float(msg)
-        if max_sidecar_timestamp is not None and timestamp is not None and timestamp <= max_sidecar_timestamp:
-            continue
         key = _session_message_merge_key(msg)
+        if max_sidecar_timestamp is not None and timestamp is not None and timestamp <= max_sidecar_timestamp:
+            if key in seen_message_keys:
+                continue
+            if not (isinstance(key, tuple) and key[:1] == ("message_id",)):
+                continue
         if key in seen_message_keys:
             continue
         seen_message_keys.add(key)
