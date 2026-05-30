@@ -10,6 +10,7 @@ Skips repos that are not git checkouts (e.g. Docker baked images where
 """
 import hashlib
 import json
+import logging
 import os
 import re
 import subprocess
@@ -22,6 +23,8 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from api.config import REPO_ROOT, STREAMS, STREAMS_LOCK
+
+logger = logging.getLogger(__name__)
 
 # Lazy -- may be None if agent not found
 try:
@@ -126,10 +129,28 @@ def _restart_blocked_response(target: str, blocker_snapshot: dict | int) -> dict
     }
 
 
-def _wait_until_restart_safe(poll_seconds: float = 2.0) -> dict:
-    """Wait for active work to finish before self-reexec."""
+def _wait_until_restart_safe(poll_seconds: float = 2.0, max_wait_seconds: float = 300.0) -> dict:
+    """Wait for active work to finish before self-reexec.
+
+    Bounded by ``max_wait_seconds`` so a long-running (or stuck/orphaned) agent
+    run can't soft-jam the self-update indefinitely. If the deadline is reached
+    while work is still in flight, the snapshot is returned with
+    ``wait_timed_out=True`` so the caller can proceed with the re-exec anyway
+    (preserving the pre-#3105 "execv preempts in-flight work" fallback) rather
+    than holding ``_apply_lock`` for the run's full lifetime.
+    """
     snapshot = _restart_blocker_snapshot()
+    deadline = time.monotonic() + max(0.0, max_wait_seconds)
     while snapshot.get('restart_blocked'):
+        if time.monotonic() >= deadline:
+            logger.warning(
+                "restart-safety wait exceeded %.0fs with work still in flight (%s); "
+                "proceeding with re-exec anyway",
+                max_wait_seconds, snapshot,
+            )
+            snapshot = dict(snapshot)
+            snapshot['wait_timed_out'] = True
+            return snapshot
         time.sleep(max(0.1, poll_seconds))
         snapshot = _restart_blocker_snapshot()
     return snapshot
