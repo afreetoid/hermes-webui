@@ -34,13 +34,14 @@ except ImportError:  # pragma: no cover - exercised only where fcntl is unavaila
 from api.config import (
     _PROVIDER_DISPLAY,
     _PROVIDER_MODELS,
-    _thread_local_env_value,
     _custom_provider_slug_from_name,
     _get_label_for_model,
     _models_from_live_provider_ids,
+    _pool_entry_payloads,
     _read_live_provider_model_ids,
     _read_visible_codex_cache_model_ids,
     _save_yaml_config_file,
+    _thread_local_env_value,
     get_config,
     invalidate_models_cache,
     reload_config,
@@ -866,11 +867,7 @@ def _local_pool_snapshot(provider):
     or None if the provider has no pool or no entries.
     """
     try:
-        from agent.credential_pool import load_pool
-        from api.config import _is_ambient_gh_cli_entry
-
-        pool = load_pool(provider)
-        entries = list(pool.entries()) if pool is not None and hasattr(pool, "entries") else []
+        entries = [SimpleNamespace(**payload) for payload in _pool_entry_payloads(provider)]
     except Exception:
         return None
     if not entries:
@@ -881,11 +878,6 @@ def _local_pool_snapshot(provider):
     exhausted_count = 0
     dead_count = 0
     for index, entry in enumerate(entries, start=1):
-        source = str(_entry_value(entry, "source") or "")
-        label_val = str(_entry_value(entry, "label", "source") or "")
-        key_source = str(_entry_value(entry, "key_source") or "")
-        if _is_ambient_gh_cli_entry(source, label_val, key_source):
-            continue
         label = _safe_entry_label(entry, index)
         entry_status = str(_entry_value(entry, "last_status") or "").strip().lower()
         if entry_status == "dead":
@@ -1290,22 +1282,15 @@ def _get_provider_api_key(provider_id: str) -> str | None:
                 if _provider_value_counts_as_api_key(provider_id, cp_key):
                     return cp_key
     # Fallback: try credential pool (e.g. bothub key stored via auth.json)
-    try:
-        from api.config import _has_explicit_pool_credentials, _resolve_provider_alias
-        if _has_explicit_pool_credentials(provider_id):
-            from agent.credential_pool import load_pool
-            # Must resolve alias here too: _has_explicit_pool_credentials does it
-            # internally, but load_pool sees the original unresolved provider_id.
-            _resolved = _resolve_provider_alias(provider_id)
-            pool = load_pool(_resolved)
-            if pool:
-                entry = pool.select()
-                if entry:
-                    key = getattr(entry, "runtime_api_key", "") or getattr(entry, "access_token", "")
-                    if key:
-                        return key
-    except ImportError:
-        pass
+    for entry in _pool_entry_payloads(provider_id):
+        key = str(
+            entry.get("runtime_api_key")
+            or entry.get("agent_key")
+            or entry.get("access_token")
+            or ""
+        ).strip()
+        if key:
+            return key
     return None
 
 

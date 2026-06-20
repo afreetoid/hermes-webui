@@ -25,6 +25,7 @@ import urllib.error
 import urllib.request
 import uuid
 from pathlib import Path
+from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 # ── Basic layout ──────────────────────────────────────────────────────────────
@@ -4162,18 +4163,37 @@ def _credential_pool_profile_tag() -> str:
         return ""
 
 
-def _has_explicit_pool_credentials(provider_id: str) -> bool:
-    """Return True when the credential pool has at least one non-ambient entry
-    for *provider_id* (i.e. not a gh-cli / GITHUB_TOKEN auto-detect).
+def _pool_entry_payloads(provider_id: str) -> list[dict[str, Any]]:
+    """Return explicit credential-pool entry payloads for the active profile.
 
-    Reuses ``_CREDENTIAL_POOL_CACHE`` so that callers on hot paths (provider
-    detection, model listing, live-model fetch) don't pay the ~10s load_pool
-    cost more than once per TTL window.
+    Readonly profile scopes must not let ``load_pool()`` seed from process env,
+    because that can materialize server-default credentials into a named
+    profile's auth store. In that mode, read raw auth.json payloads only.
     """
+    _pid = _resolve_provider_alias(provider_id)
+    if bool(getattr(_thread_ctx, "block_process_env_fallback", False)):
+        try:
+            from hermes_cli.auth import read_credential_pool as _read_credential_pool
+
+            raw_entries = _read_credential_pool(_pid)
+        except ImportError:
+            return []
+        payloads: list[dict[str, Any]] = []
+        for entry in raw_entries:
+            if not isinstance(entry, dict):
+                continue
+            if _is_ambient_gh_cli_entry(
+                str(entry.get("source", "") or ""),
+                str(entry.get("label", "") or ""),
+                str(entry.get("key_source", "") or ""),
+            ):
+                continue
+            payloads.append(dict(entry))
+        return payloads
+
     try:
         from agent.credential_pool import load_pool as _load_pool
 
-        _pid = _resolve_provider_alias(provider_id)
         _ck = (_credential_pool_profile_tag(), _pid)
         _cached = _CREDENTIAL_POOL_CACHE.get(_ck)
         if _cached is not None:
@@ -4188,17 +4208,46 @@ def _has_explicit_pool_credentials(provider_id: str) -> bool:
             _cp_pool = _load_pool(_pid)
             _CREDENTIAL_POOL_CACHE[_ck] = (time.time(), _cp_pool)
             _all_entries = _cp_pool.entries()
-
-        return any(
-            not _is_ambient_gh_cli_entry(
-                str(getattr(e, "source", "") or ""),
-                str(getattr(e, "label", "") or ""),
-                str(getattr(e, "key_source", "") or ""),
-            )
-            for e in _all_entries
-        )
     except ImportError:
-        return False
+        return []
+
+    payloads = []
+    for entry in _all_entries:
+        if _is_ambient_gh_cli_entry(
+            str(getattr(entry, "source", "") or ""),
+            str(getattr(entry, "label", "") or ""),
+            str(getattr(entry, "key_source", "") or ""),
+        ):
+            continue
+        payload = entry.to_dict() if hasattr(entry, "to_dict") else {}
+        if not isinstance(payload, dict):
+            payload = {}
+        payload = dict(payload)
+        payload.setdefault("source", str(getattr(entry, "source", "") or ""))
+        payload.setdefault("label", str(getattr(entry, "label", "") or ""))
+        payload.setdefault("key_source", str(getattr(entry, "key_source", "") or ""))
+        runtime_api_key = getattr(entry, "runtime_api_key", None)
+        if runtime_api_key:
+            payload["runtime_api_key"] = runtime_api_key
+        base_url = getattr(entry, "base_url", None)
+        if base_url:
+            payload["base_url"] = base_url
+        inference_base_url = getattr(entry, "inference_base_url", None)
+        if inference_base_url:
+            payload["inference_base_url"] = inference_base_url
+        payloads.append(payload)
+    return payloads
+
+
+def _has_explicit_pool_credentials(provider_id: str) -> bool:
+    """Return True when the credential pool has at least one non-ambient entry
+    for *provider_id* (i.e. not a gh-cli / GITHUB_TOKEN auto-detect).
+
+    Reuses ``_CREDENTIAL_POOL_CACHE`` so that callers on hot paths (provider
+    detection, model listing, live-model fetch) don't pay the ~10s load_pool
+    cost more than once per TTL window.
+    """
+    return bool(_pool_entry_payloads(provider_id))
 _provider_models_invalidated_ts: dict[str, float] = {}  # provider_id -> timestamp of last invalidation
 
 # Disk-backed in-memory cache for get_available_models().

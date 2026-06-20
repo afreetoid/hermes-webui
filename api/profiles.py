@@ -811,6 +811,64 @@ def filter_runtime_env_for_gateway_parity(env: dict[str, str]) -> dict[str, str]
     return filtered
 
 
+def _profile_secret_env_names(profile_home_path: Path) -> set[str]:
+    names: set[str] = set()
+    try:
+        from api.providers import _provider_credential_env_vars
+
+        names.update(_provider_credential_env_vars())
+    except Exception:
+        logger.debug(
+            "Failed to load provider credential env names for profile scope",
+            exc_info=True,
+        )
+
+    config_path = Path(profile_home_path) / "config.yaml"
+    if not config_path.exists():
+        return names
+    try:
+        payload = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        logger.debug(
+            "Failed to inspect custom-provider credential env names from %s",
+            config_path,
+            exc_info=True,
+        )
+        return names
+
+    custom_providers = payload.get("custom_providers") if isinstance(payload, dict) else None
+    if not isinstance(custom_providers, list):
+        return names
+    for custom_provider in custom_providers:
+        if not isinstance(custom_provider, dict):
+            continue
+        key_env = str(custom_provider.get("key_env") or "").strip()
+        if key_env:
+            names.add(key_env)
+        api_key = str(custom_provider.get("api_key") or "").strip()
+        match = re.fullmatch(r"\$\{([^}]+)\}", api_key)
+        if match:
+            env_name = str(match.group(1) or "").strip()
+            if env_name:
+                names.add(env_name)
+    return names
+
+
+def _apply_profile_env_to_process(
+    process_env,
+    safe_runtime_env: dict[str, str],
+    *,
+    secret_env_names: set[str],
+) -> dict[str, Optional[str]]:
+    scoped_keys = set(safe_runtime_env) | set(secret_env_names)
+    previous_env = {key: process_env.get(key) for key in scoped_keys}
+    for key in secret_env_names:
+        if key not in safe_runtime_env:
+            process_env.pop(key, None)
+    process_env.update(safe_runtime_env)
+    return previous_env
+
+
 @contextmanager
 def profile_env_for_background_worker(
     session,
@@ -840,6 +898,7 @@ def profile_env_for_background_worker(
         profile_home_path = Path(get_hermes_home_for_profile(profile))
         runtime_env = get_profile_runtime_env(profile_home_path)
         safe_runtime_env = filter_runtime_env_for_gateway_parity(runtime_env)
+        secret_env_names = _profile_secret_env_names(profile_home_path)
     except Exception:
         log.debug(
             "Failed to resolve profile env for %s profile %s; falling back to current env",
@@ -862,14 +921,21 @@ def profile_env_for_background_worker(
     old_hermes_home = None
     had_hermes_home = False
     previous_thread_env = getattr(_thread_ctx, "env", {}).copy()
+    previous_block_process_env = bool(
+        getattr(_thread_ctx, "block_process_env_fallback", False)
+    )
     try:
         _set_thread_env(**thread_env)
+        _thread_ctx.block_process_env_fallback = True
         with _ENV_LOCK:
-            old_runtime_env = {key: os.environ.get(key) for key in safe_runtime_env}
+            old_runtime_env = _apply_profile_env_to_process(
+                os.environ,
+                safe_runtime_env,
+                secret_env_names=secret_env_names,
+            )
             had_hermes_home = "HERMES_HOME" in os.environ
             old_hermes_home = os.environ.get("HERMES_HOME")
             skill_home_snapshot = snapshot_skill_home_modules()
-            os.environ.update(safe_runtime_env)
             os.environ["HERMES_HOME"] = str(profile_home_path)
             try:
                 patch_skill_home_modules(profile_home_path)
@@ -882,6 +948,7 @@ def profile_env_for_background_worker(
                 )
         yield
     finally:
+        _thread_ctx.block_process_env_fallback = previous_block_process_env
         if previous_thread_env:
             _set_thread_env(**previous_thread_env)
         else:

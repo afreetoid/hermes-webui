@@ -323,6 +323,27 @@ def test_active_request_readonly_scope_blocks_process_env_fallback(monkeypatch, 
         profiles.clear_request_profile()
 
 
+def test_active_request_readonly_scope_blocks_pool_env_seed(monkeypatch, tmp_path):
+    """Readonly profile reads must not let load_pool seed process-default keys."""
+    from api.providers import _get_provider_api_key, _provider_has_key
+
+    base = tmp_path / ".hermes"
+    work_home = base / "profiles" / "work"
+    work_home.mkdir(parents=True)
+    monkeypatch.setattr(profiles, "_DEFAULT_HERMES_HOME", base)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "from-process-env")
+
+    profiles.set_request_profile("work")
+    try:
+        with profiles.profile_env_for_active_request_readonly("test"):
+            assert _provider_has_key("openrouter") is False
+            assert _get_provider_api_key("openrouter") is None
+    finally:
+        profiles.clear_request_profile()
+
+    assert (work_home / "auth.json").exists() is False
+
+
 def test_providers_and_models_routes_wrap_in_profile_env():
     """The two read routes are profile-scoped for non-default profiles (#3957).
 
@@ -491,6 +512,46 @@ def test_detached_worker_prefers_profile_key_for_custom_provider(monkeypatch, tm
     t.start()
     t.join()
     assert out["value"] == "from-worker-profile"
+
+
+def test_detached_worker_scope_blocks_pool_env_seed(monkeypatch, tmp_path):
+    """Detached worker scope must not let load_pool seed process-default keys."""
+    base = tmp_path / ".hermes"
+    work_home = base / "profiles" / "work"
+    work_home.mkdir(parents=True)
+    monkeypatch.setattr(profiles, "_DEFAULT_HERMES_HOME", base)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "from-process-env")
+
+    with profiles.profile_scope_for_detached_worker("work", "test-worker"):
+        assert os.environ.get("OPENROUTER_API_KEY") is None
+        assert config._has_explicit_pool_credentials("openrouter") is False
+        assert getattr(config._thread_ctx, "block_process_env_fallback", False) is True
+
+    assert os.environ.get("OPENROUTER_API_KEY") == "from-process-env"
+    assert getattr(config._thread_ctx, "block_process_env_fallback", False) is False
+    assert (work_home / "auth.json").exists() is False
+
+
+def test_detached_worker_scope_scrubs_absent_custom_provider_key_env(monkeypatch, tmp_path):
+    """Detached worker scope clears missing custom-provider key_env fallbacks too."""
+    base = tmp_path / ".hermes"
+    work_home = base / "profiles" / "work"
+    work_home.mkdir(parents=True)
+    (work_home / "config.yaml").write_text(
+        "custom_providers:\n"
+        "  - name: Team\n"
+        "    base_url: https://example.invalid/v1\n"
+        "    key_env: ISSUE_3957_CUSTOM_KEY\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(profiles, "_DEFAULT_HERMES_HOME", base)
+    monkeypatch.setenv("ISSUE_3957_CUSTOM_KEY", "from-process-env")
+
+    with profiles.profile_scope_for_detached_worker("work", "test-worker"):
+        assert os.environ.get("ISSUE_3957_CUSTOM_KEY") is None
+        assert config._thread_local_env_value("ISSUE_3957_CUSTOM_KEY") == ""
+
+    assert os.environ.get("ISSUE_3957_CUSTOM_KEY") == "from-process-env"
 
 
 def test_account_usage_subprocess_env_blocks_process_default_key(monkeypatch, tmp_path):
