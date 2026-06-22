@@ -14,6 +14,7 @@ from urllib.parse import quote
 logger = logging.getLogger(__name__)
 _PUSH_STORE_NAME = "webui_push_subscriptions.json"
 _STORE_LOCK = threading.Lock()
+_WEB_PUSH_TIMEOUT_SECONDS = 10
 
 
 def _subscription_store_path() -> Path:
@@ -181,6 +182,7 @@ def send_web_push(payload: dict) -> int:
                 data=data,
                 vapid_private_key=web_push_private_key(),
                 vapid_claims=claims,
+                timeout=_WEB_PUSH_TIMEOUT_SECONDS,
             )
             sent += 1
         except Exception as exc:

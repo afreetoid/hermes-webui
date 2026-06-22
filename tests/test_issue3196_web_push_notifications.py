@@ -69,13 +69,14 @@ def test_subscription_store_round_trip_and_stale_prune(monkeypatch, tmp_path):
 
     calls = []
 
-    def _fake_webpush(*, subscription_info, data, vapid_private_key, vapid_claims):
+    def _fake_webpush(*, subscription_info, data, vapid_private_key, vapid_claims, timeout):
         calls.append(
             {
                 "endpoint": subscription_info["endpoint"],
                 "data": json.loads(data),
                 "vapid_private_key": vapid_private_key,
                 "vapid_claims": dict(vapid_claims),
+                "timeout": timeout,
             }
         )
         if subscription_info["endpoint"].endswith("/dead"):
@@ -100,6 +101,7 @@ def test_subscription_store_round_trip_and_stale_prune(monkeypatch, tmp_path):
     assert calls[0]["data"]["options"]["data"]["url"].endswith("/session/session-123")
     assert calls[0]["vapid_private_key"] == "private-key"
     assert calls[0]["vapid_claims"]["sub"] == "mailto:test@example.com"
+    assert calls[0]["timeout"] == web_push._WEB_PUSH_TIMEOUT_SECONDS
     assert [sub["endpoint"] for sub in web_push.list_subscriptions()] == ["https://push.example/live"]
 
 
