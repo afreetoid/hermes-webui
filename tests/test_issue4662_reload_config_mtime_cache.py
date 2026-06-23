@@ -78,6 +78,74 @@ def test_reload_config_expands_env_vars(tmp_path, monkeypatch):
     assert key == "expanded-value-xyz", f"env var not expanded after reload: {key!r}"
 
 
+def test_reload_config_reexpands_env_when_mtime_unchanged(tmp_path, monkeypatch):
+    """#798 hardening (Opus gate): the mtime cache must store the RAW, un-expanded
+    YAML — not the expanded result — so that a ${VAR} re-expands against the CURRENT
+    os.environ on every reload even when config.yaml's mtime is unchanged. If the
+    cache stored the expanded value, a profile/env change with an unchanged file
+    would serve a stale expansion (cross-profile credential bleed)."""
+    import api.config as cfg
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "providers:\n  openai:\n    api_key: ${HERMES_TEST_REEXPAND_TOKEN}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cfg, "_get_config_path", lambda: config_path)
+    with cfg._yaml_file_cache_lock:
+        cfg._yaml_file_cache.clear()
+
+    # First reload under env value A.
+    monkeypatch.setenv("HERMES_TEST_REEXPAND_TOKEN", "value-A")
+    cfg.reload_config()
+    key_a = ((cfg.get_config().get("providers") or {}).get("openai") or {}).get("api_key")
+    assert key_a == "value-A", f"first expansion wrong: {key_a!r}"
+
+    # Change ONLY the env var — the file (and its mtime) is untouched, so the YAML
+    # parse cache will hit. The expansion must still pick up the new env value.
+    monkeypatch.setenv("HERMES_TEST_REEXPAND_TOKEN", "value-B")
+    cfg.reload_config()
+    key_b = ((cfg.get_config().get("providers") or {}).get("openai") or {}).get("api_key")
+    assert key_b == "value-B", (
+        f"env change with unchanged mtime did not re-expand (got {key_b!r}); "
+        "the mtime cache is storing the EXPANDED value instead of raw YAML "
+        "-> cross-profile credential-bleed risk (#798)"
+    )
+
+
+def test_reload_config_does_not_cross_serve_between_profile_paths(tmp_path, monkeypatch):
+    """#798 hardening (Opus gate): the YAML parse cache is keyed on the config PATH
+    (plus mtime+size), so two different profiles' config.yaml files must never serve
+    each other's parsed content — even within the same process. A path-blind cache
+    would leak one profile's providers/keys into another."""
+    import api.config as cfg
+
+    path_a = tmp_path / "profile_a" / "config.yaml"
+    path_b = tmp_path / "profile_b" / "config.yaml"
+    path_a.parent.mkdir(parents=True, exist_ok=True)
+    path_b.parent.mkdir(parents=True, exist_ok=True)
+    path_a.write_text("providers:\n  openai:\n    models: [model-a]\n", encoding="utf-8")
+    path_b.write_text("providers:\n  anthropic:\n    models: [model-b]\n", encoding="utf-8")
+
+    with cfg._yaml_file_cache_lock:
+        cfg._yaml_file_cache.clear()
+
+    monkeypatch.setattr(cfg, "_get_config_path", lambda: path_a)
+    cfg.reload_config()
+    providers_a = cfg.get_config().get("providers") or {}
+    assert "openai" in providers_a and "anthropic" not in providers_a, (
+        f"profile A served the wrong config: {sorted(providers_a)}"
+    )
+
+    monkeypatch.setattr(cfg, "_get_config_path", lambda: path_b)
+    cfg.reload_config()
+    providers_b = cfg.get_config().get("providers") or {}
+    assert "anthropic" in providers_b and "openai" not in providers_b, (
+        f"profile B was cross-served profile A's config (cache not path-keyed): "
+        f"{sorted(providers_b)}"
+    )
+
+
 def test_reload_config_empty_dict_config_does_not_spin(tmp_path, monkeypatch):
     """An empty ``{}`` config must still stamp _cfg_mtime, or get_config()'s
     `current_mtime != _cfg_mtime` stale check fires forever and re-enters
