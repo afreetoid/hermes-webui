@@ -559,7 +559,7 @@ _yaml_file_cache: dict[str, tuple] = {}
 _yaml_file_cache_lock = threading.Lock()
 
 
-def _load_yaml_config_file_raw(config_path: Path) -> dict:
+def _load_yaml_config_file_raw(config_path: Path, *, _copy: bool = True) -> dict:
     """Return the RAW (un-env-expanded) parsed config dict, memoized on
     (resolved path, st_mtime_ns, st_size). Shared parse core for
     _load_yaml_config_file() and reload_config(): the former runs the helper's
@@ -569,6 +569,11 @@ def _load_yaml_config_file_raw(config_path: Path) -> dict:
     (mtime, size) — a UI sync storm can't turn into a YAML-reparse storm (#4650),
     and an unchanged config.yaml isn't reparsed on the profile-switch hot path
     (#4662 Phase 2).
+
+    By default returns a deep copy so a caller can never mutate the shared cache
+    entry (greptile #4741). Internal callers that immediately pass the result
+    through _expand_env_vars() (which itself returns a fresh structure and never
+    mutates its input) pass _copy=False to skip the redundant copy on the hot path.
     """
     try:
         import yaml as _yaml
@@ -587,7 +592,9 @@ def _load_yaml_config_file_raw(config_path: Path) -> dict:
         cached = _yaml_file_cache.get(cache_key)
         if cached is not None and cached[0] == stat_key:
             raw = cached[1]
-            return raw if isinstance(raw, dict) else {}
+            if not isinstance(raw, dict):
+                return {}
+            return copy.deepcopy(raw) if _copy else raw
 
     # Cache miss / stale: parse off disk. Done outside the lock so a slow parse
     # doesn't serialize unrelated paths; a concurrent duplicate parse is harmless.
@@ -600,11 +607,14 @@ def _load_yaml_config_file_raw(config_path: Path) -> dict:
     raw = loaded if isinstance(loaded, dict) else {}
     with _yaml_file_cache_lock:
         _yaml_file_cache[cache_key] = (stat_key, raw)
-    return raw
+    return copy.deepcopy(raw) if _copy else raw
 
 
 def _load_yaml_config_file(config_path: Path) -> dict:
-    raw = _load_yaml_config_file_raw(config_path)
+    # _copy=False: _expand_env_vars returns a fresh structure and never mutates
+    # its input, so the env-expanded result is already cache-safe — no need to
+    # deep-copy the raw dict first (keeps the /api/reasoning hot path cheap).
+    raw = _load_yaml_config_file_raw(config_path, _copy=False)
     if not raw:
         return {}
     expanded = _expand_env_vars(raw)

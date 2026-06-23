@@ -2131,8 +2131,9 @@ def _session_list_payload_to_response(payload: dict) -> dict:
     # plumbing already exists; this wires the caller so the sidebar list path gets the
     # same read-once optimization redact_session_data() already uses. On a large list
     # this was the multi-second response_write stage in /api/sessions diagnostics. (#4662 Phase 3)
+    # load_settings is imported at module scope (below); this function only runs at
+    # request time, well after module load, so no lazy import is needed.
     try:
-        from api.config import load_settings
         _redact_enabled = bool(load_settings().get("api_redact_enabled", True))
     except Exception:
         _redact_enabled = True  # fail safe: redact when settings are unreadable
