@@ -308,6 +308,42 @@ class TestNestedDeletionDetected:
         assert result == (1, 1)
 
 
+class TestSymlinkedSkillProbeFollowsLinks:
+    """The mtime probe must follow symlinked skill directories the same way the
+    compute path (iter_skill_index_files, followlinks=True) does — otherwise an
+    edit to a symlinked skill's target SKILL.md is invisible to the probe and
+    the counts stay stale up to the TTL (gate finding)."""
+
+    def test_symlinked_skill_target_edit_changes_probe(self, profiles_mod, tmp_path):
+        mod, profile_dir = profiles_mod
+        skills_dir = profile_dir / "skills"
+        skills_dir.mkdir(parents=True, exist_ok=True)
+        config_path = profile_dir / "config.yaml"
+
+        # Real skill living OUTSIDE the profile, linked in via a symlinked dir.
+        target = tmp_path / "external-skill"
+        target.mkdir()
+        skill_md = target / "SKILL.md"
+        skill_md.write_text("---\nname: linked\n---\n# linked\n", encoding="utf-8")
+        link = skills_dir / "linked"
+        try:
+            link.symlink_to(target, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            import pytest
+            pytest.skip("symlinks not supported on this platform")
+
+        before = mod._skill_tree_max_mtime_ns(skills_dir, config_path)
+        # Edit the target SKILL.md (bump its mtime well past granularity).
+        import os as _os
+        future = time.time() + 100
+        _os.utime(skill_md, (future, future))
+        after = mod._skill_tree_max_mtime_ns(skills_dir, config_path)
+
+        assert after > before, (
+            "probe must follow the symlinked skill dir and see the target SKILL.md mtime change"
+        )
+
+
 class TestReturnSignature:
     """Proof matrix row 6: return signature is tuple[int, int]."""
 

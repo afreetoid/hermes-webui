@@ -1597,7 +1597,10 @@ def _skill_tree_max_mtime_ns(skills_dir: Path, config_path: Path) -> int:
         return max_ns
     try:
         # Directory mtimes catch nested out-of-band deletes that leave file mtimes unchanged.
-        for root, dirnames, filenames in os.walk(skills_dir):
+        # followlinks=True mirrors agent.skill_utils.iter_skill_index_files (the compute
+        # path), so a symlinked skill directory is descended into and edits to its target
+        # SKILL.md change the probe value — otherwise such edits would stay stale up to the TTL.
+        for root, dirnames, filenames in os.walk(skills_dir, followlinks=True):
             root_path = Path(root)
             try:
                 max_ns = max(max_ns, root_path.stat().st_mtime_ns)
