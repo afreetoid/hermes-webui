@@ -11714,11 +11714,7 @@ def handle_post(handler, parsed) -> bool:
                 SESSIONS.move_to_end(copied_session.session_id)
                 while len(SESSIONS) > SESSIONS_MAX:
                     SESSIONS.popitem(last=False)
-            # Persist immediately. The pre-PR flow (/api/session/new + /api/session/rename)
-            # accidentally avoided this because `/api/session/rename` calls `s.save()`.
-            # Without this explicit save, the duplicate is in-memory only — if the user
-            # refreshes before sending a turn, the duplicate vanishes.
-            copied_session.save()
+            copied_session.save()  # Persist before the duplicate can be lost on refresh.
             publish_session_list_changed(
                 "session_duplicate",
                 profile=getattr(copied_session, "profile", None),
