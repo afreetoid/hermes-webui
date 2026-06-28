@@ -16,6 +16,7 @@ OFFICE_RENDER_MODE = "code"
 _DOCX_BODY_CHILDREN = {qn("w:p"), qn("w:sectPr")}
 _DOCX_PARAGRAPH_CHILDREN = {qn("w:r")}
 _DOCX_RUN_CHILDREN = {qn("w:t")}
+_DOCX_UNSAFE_SECTION_CHILDREN = {qn("w:headerReference"), qn("w:footerReference")}
 
 
 def is_claimed_office_path(path: str | Path) -> bool:
@@ -56,6 +57,10 @@ def _docx_editability(document: Document) -> tuple[bool, str | None]:
     for child in body:
         if child.tag not in _DOCX_BODY_CHILDREN:
             return False, "docx contains unsupported structures"
+        if child.tag == qn("w:sectPr"):
+            for section_child in child:
+                if section_child.tag in _DOCX_UNSAFE_SECTION_CHILDREN:
+                    return False, "docx contains unsupported section content"
     for paragraph in document.paragraphs:
         for child in paragraph._p:
             if child.tag not in _DOCX_PARAGRAPH_CHILDREN:
