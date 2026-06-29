@@ -468,3 +468,23 @@ def test_freetext_token_scrubbed_even_when_api_redaction_disabled(monkeypatch):
         "notes": "operator pasted sk-live-PASTEDLEAK5088 here",
     })
     assert "PASTEDLEAK5088" not in json.dumps(safe)
+
+
+def test_yaml_alias_shared_secret_is_redacted_everywhere():
+    """#5088 round 5 (Codex re-gate): a YAML alias (&pw/*pw) shares one scalar
+    between a sensitive key and a benign key. The value-taint pass must redact
+    the secret under the benign key too — while short/benign values that merely
+    collide are NOT over-masked."""
+    safe = routes._redact_config_for_display({
+        "auth": {"password": "correct-horse-battery-staple"},
+        "notes": {"sample": "correct-horse-battery-staple"},  # alias -> same value
+        "ui": {"theme": "dark", "lang": "en"},                 # short benign, must survive
+        "port": 8787,
+    })
+    blob = json.dumps(safe)
+    assert "correct-horse-battery-staple" not in blob
+    assert safe["notes"]["sample"] == "[REDACTED]"
+    # no over-masking of short benign values
+    assert safe["ui"]["theme"] == "dark"
+    assert safe["ui"]["lang"] == "en"
+    assert safe["port"] == 8787

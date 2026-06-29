@@ -519,7 +519,31 @@ def _scrub_config_scalar_secrets(text: str) -> str:
     return text
 
 
-def _redact_config_for_display(value, *, path: tuple[str, ...] = ()):
+def _collect_sensitive_scalar_values(value, *, path: tuple[str, ...] = (), out: set | None = None) -> set:
+    """Collect every non-trivial scalar value that appears under a sensitive key
+    path, so the display pass can redact the SAME value wherever else it appears.
+
+    Closes the YAML-alias leak (#5088 round 5): ``password: &pw SECRET`` (sensitive
+    key) plus ``note: *pw`` (benign key) resolve to the same scalar; without value
+    taint the benign copy would leak the secret verbatim.
+    """
+    if out is None:
+        out = set()
+    if isinstance(value, dict):
+        for k, v in value.items():
+            _collect_sensitive_scalar_values(v, path=path + (str(k),), out=out)
+    elif isinstance(value, list):
+        for v in value:
+            _collect_sensitive_scalar_values(v, path=path, out=out)
+    elif _config_path_is_sensitive(path):
+        # Only taint substantial string secrets — short/empty/numeric values are
+        # too collision-prone to redact globally (would mask benign matches).
+        if isinstance(value, str) and len(value) >= 6:
+            out.add(value)
+    return out
+
+
+def _redact_config_for_display(value, *, path: tuple[str, ...] = (), tainted: frozenset | None = None):
     """Return a config structure safe to display in the browser.
 
     Security contract (#2929): no credential value — of ANY type (str, int,
@@ -532,6 +556,10 @@ def _redact_config_for_display(value, *, path: tuple[str, ...] = ()):
     two branches (path-check after the type passthrough) reintroduces the leak —
     see tests/test_safe_config_viewer.py for the non-vacuous regression.
 
+    Value taint (#5088 round 5): any scalar string equal to a value that ALSO
+    appears under a sensitive key path is redacted everywhere — closing the
+    YAML-alias leak (``&pw``/``*pw`` shared between a sensitive and a benign key).
+
     Non-secret strings are scrubbed UNCONDITIONALLY for inline credentials
     (``_scrub_config_scalar_secrets`` — URL userinfo + sensitive query/fragment
     params + known capability-URL path tokens, #5088) and then run through the
@@ -541,16 +569,23 @@ def _redact_config_for_display(value, *, path: tuple[str, ...] = ()):
     unconditional. A "safe" config view must never leak a credential, even when
     an operator has disabled response redaction.
     """
+    if tainted is None:
+        # Top-level entry: collect sensitive scalar values once for the whole tree.
+        tainted = frozenset(_collect_sensitive_scalar_values(value))
     if isinstance(value, dict):
         return {
-            str(k): _redact_config_for_display(v, path=path + (str(k),))
+            str(k): _redact_config_for_display(v, path=path + (str(k),), tainted=tainted)
             for k, v in value.items()
         }
     if isinstance(value, list):
-        return [_redact_config_for_display(v, path=path) for v in value]
+        return [_redact_config_for_display(v, path=path, tainted=tainted) for v in value]
     # Maintainer fix #1: mask by sensitive key path FIRST, regardless of type.
     if _config_path_is_sensitive(path):
         return "[REDACTED]" if value not in (None, "") else value
+    # Value taint: a scalar equal to a secret seen under a sensitive path (e.g. a
+    # YAML alias) is redacted even under a benign key.
+    if isinstance(value, str) and value in tainted:
+        return "[REDACTED]"
     # Non-sensitive key path: pass scalars through; scrub free-text values.
     if value is None or isinstance(value, (bool, int, float)):
         return value
