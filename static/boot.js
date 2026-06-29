@@ -111,12 +111,6 @@ async function _applyComposerPrefillOnBoot(prefillIntent){
   msg.value=text;
   if(typeof autoResize==='function') autoResize();
   else if(typeof updateSendBtn==='function') updateSendBtn();
-  if(!prefillIntent.autoSend) return;
-  if(typeof handleComposerPrimaryAction==='function'){
-    await handleComposerPrimaryAction();
-    return;
-  }
-  if(typeof send==='function') await send();
 }
 
 // Mobile navigation.

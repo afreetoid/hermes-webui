@@ -3230,12 +3230,11 @@ function _composerPrefillIntentFromLocation(){
     const hasSend=qs.has('send');
     if(!hasQ&&!hasPrompt&&!hasSend) return empty;
     const text=hasQ?(qs.get('q')||''):(hasPrompt?(qs.get('prompt')||''):'');
-    const autoSend=hasSend&&/^(1|true|yes|on)$/i.test(String(qs.get('send')||'').trim());
     return {
       hasParams:true,
       hasText:!!String(text).trim(),
       text,
-      autoSend
+      autoSend:false
     };
   }catch(_e){return empty;}
 }
