@@ -1522,11 +1522,6 @@ async function loadSession(sid){
   // Sync workspace display immediately so the chip label reflects the new session's workspace
   // before any async message-loading begins (mirrors how model is handled).
   if(typeof syncTopbar==='function') syncTopbar();
-  _acknowledgeSessionVisit(
-    S.session.session_id,
-    Number(data.session.message_count || 0),
-    Number(data.session.last_message_at || data.session.updated_at || 0)
-  );
   try{localStorage.setItem('hermes-webui-session',S.session.session_id);}catch(_){}
   _setActiveSessionUrl(S.session.session_id);
   if(typeof startSessionStream==='function') startSessionStream(S.session.session_id);
@@ -1551,6 +1546,17 @@ async function loadSession(sid){
       if(typeof clearInflightState==='function') clearInflightState(sid);
     }
   }
+  // Acknowledge the visit AFTER the idle-reset above so the sidebar snapshot's
+  // streaming flag is derived from THIS session's real state, not a stale
+  // S.busy left over from a still-streaming previous session. Acknowledging
+  // before the reset stamped _sessionStreamingById[sid]=true on an idle
+  // session, which a later poll could turn into a phantom unread dot — exactly
+  // the class of bug this change fixes.
+  _acknowledgeSessionVisit(
+    S.session.session_id,
+    Number(data.session.message_count || 0),
+    Number(data.session.last_message_at || data.session.updated_at || 0)
+  );
 
   function _mergePendingSessionMessage(session,messages){
     if(!Array.isArray(messages)) return false;
