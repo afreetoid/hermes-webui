@@ -4325,10 +4325,17 @@ if(document.readyState==='loading'){
 
 // ── Reasoning effort chip ────────────────────────────────────────────────────
 let _currentReasoningEffort=null;
+let _currentReasoningScope='profile';
+let _currentReasoningStatus=null;
 let _currentReasoningEffortsSupported=null;
+let _reasoningDropdownBuilt=false;
 
 function _normalizeReasoningEffort(eff){
   return String(eff||'').trim().toLowerCase();
+}
+
+function _normalizeReasoningScope(scope){
+  return scope==='session' ? 'session' : 'profile';
 }
 
 function _formatReasoningEffortLabel(effort){
@@ -4342,6 +4349,18 @@ function _formatReasoningEffortLabel(effort){
   return effort.charAt(0).toUpperCase()+effort.slice(1);
 }
 
+function _formatReasoningScopeLabel(scope){
+  return _normalizeReasoningScope(scope)==='session' ? 'Session' : 'Profile';
+}
+
+function _reasoningOptionLabel(scope, effortLabel){
+  return effortLabel;
+}
+
+function _activeReasoningSessionId(){
+  return (S&&S.session&&S.session.session_id) ? String(S.session.session_id) : '';
+}
+
 function _reasoningEffortContext(){
   const sel=$('modelSelect');
   const model=(S&&S.session&&S.session.model)||(sel&&sel.value)||'';
@@ -4352,6 +4371,10 @@ function _reasoningEffortContext(){
   const ctx={};
   if(model) ctx.model=model;
   if(provider) ctx.provider=provider;
+  const sessionId=typeof _activeReasoningSessionId==='function'
+    ? _activeReasoningSessionId()
+    : ((S&&S.session&&S.session.session_id) ? String(S.session.session_id) : '');
+  if(sessionId) ctx.session_id=sessionId;
   return ctx;
 }
 
@@ -4361,11 +4384,70 @@ function _reasoningEffortQuery(){
   return qs?('?'+qs):'';
 }
 
+function _reasoningWriteContext(scope){
+  const ctx=_reasoningEffortContext();
+  if(_normalizeReasoningScope(scope)==='profile'){
+    delete ctx.session_id;
+    return ctx;
+  }
+  if(!ctx.session_id) return null;
+  return ctx;
+}
+
+function _reasoningEndpointForScope(scope){
+  return _normalizeReasoningScope(scope)==='session' ? '/api/session/reasoning' : '/api/reasoning';
+}
+
+function _ensureReasoningDropdownOptions(){
+  const dd=$('composerReasoningDropdown');
+  if(!dd||_reasoningDropdownBuilt) return;
+  const source=Array.from(dd.querySelectorAll('.reasoning-option'));
+  if(!source.length) return;
+  const templates=source.map(function(opt){
+    return {
+      effort:String(opt.dataset.effort||'').trim().toLowerCase(),
+      label:String(opt.textContent||'').trim() || _formatReasoningEffortLabel(opt.dataset.effort),
+    };
+  });
+  dd.innerHTML='';
+  ['session','profile'].forEach(function(scope){
+    const header=document.createElement('div');
+    header.className='reasoning-option-group';
+    header.textContent=_normalizeReasoningScope(scope)==='session' ? 'This session' : 'Profile default';
+    header.style.cssText='padding:6px 10px 4px;font-size:11px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;';
+    dd.appendChild(header);
+    if(_normalizeReasoningScope(scope)==='session'){
+      // The session override is otherwise a one-way door: the backend clears it
+      // on an empty POST, but nothing else in the UI ever sends that clear.
+      const clearOpt=document.createElement('div');
+      clearOpt.className='reasoning-option';
+      clearOpt.dataset.scope='session';
+      clearOpt.dataset.clear='1';
+      clearOpt.textContent='Use profile default';
+      dd.appendChild(clearOpt);
+    }
+    templates.forEach(function(template){
+      const opt=document.createElement('div');
+      opt.className='reasoning-option';
+      opt.dataset.effort=template.effort;
+      opt.dataset.scope=scope;
+      opt.textContent=_reasoningOptionLabel(scope, template.label);
+      dd.appendChild(opt);
+    });
+  });
+  _reasoningDropdownBuilt=true;
+}
+
 function _applyReasoningOptions(supportedEfforts){
+  _ensureReasoningDropdownOptions();
   const dd=$('composerReasoningDropdown');
   if(!dd) return;
   const supported=new Set(Array.isArray(supportedEfforts)?supportedEfforts:[]);
   dd.querySelectorAll('.reasoning-option').forEach(function(opt){
+    if(opt.dataset.clear){
+      opt.style.display='';
+      return;
+    }
     const effort=opt.dataset.effort;
     if(effort==='none'){
       opt.style.display='';
@@ -4382,7 +4464,17 @@ function _applyReasoningOptions(supportedEfforts){
 function _applyReasoningChip(eff){
   const meta=arguments[1]||null;
   const effort=_normalizeReasoningEffort(eff);
+  const hasScopeFormatter=typeof _formatReasoningScopeLabel==='function';
+  const normalizeScope=(typeof _normalizeReasoningScope==='function')
+    ? _normalizeReasoningScope
+    : function(scope){return scope==='session'?'session':'profile';};
+  const formatScopeLabel=hasScopeFormatter
+    ? _formatReasoningScopeLabel
+    : function(scope){return scope==='session'?'This session':'Profile default';};
+  const scope=normalizeScope(meta&&meta.reasoning_scope);
   _currentReasoningEffort=effort;
+  _currentReasoningScope=scope;
+  _currentReasoningStatus=meta&&typeof meta==='object' ? meta : null;
   if(meta&&Array.isArray(meta.supported_efforts)){
     _currentReasoningEffortsSupported=meta.supported_efforts;
   }
@@ -4407,17 +4499,23 @@ function _applyReasoningChip(eff){
   if(mobileAction) mobileAction.style.display='';
   if(typeof _applyReasoningOptions==='function') _applyReasoningOptions(supportedEfforts);
   const text=_formatReasoningEffortLabel(effort);
+  const scopeText=formatScopeLabel(scope);
+  const displayText=hasScopeFormatter && scope==='session' ? (text+' · '+scopeText) : text;
   label.textContent=text;
+  if(hasScopeFormatter) label.textContent=displayText;
   if(mobileLabel) mobileLabel.textContent=text;
+  if(mobileLabel&&hasScopeFormatter) mobileLabel.textContent=displayText;
   if(chip){
     const inactive=!effort||effort==='none';
     chip.classList.toggle('inactive',inactive);
-    const labelText='Reasoning effort: '+text;
+    const labelText=hasScopeFormatter
+      ? ('Reasoning effort: '+text+' ('+scopeText.toLowerCase()+' scope)')
+      : ('Reasoning effort: '+text);
     chip.title=labelText;
     chip.setAttribute('aria-label',labelText);
   }
   if(mobileAction) mobileAction.classList.toggle('inactive',!effort||effort==='none');
-  _highlightReasoningOption(effort);
+  _highlightReasoningOption(effort, scope, _currentReasoningStatus);
 }
 
 // Tracks the model/provider identity of the last reasoning fetch so routine
@@ -4472,17 +4570,53 @@ function syncReasoningChip(){
   // response (10 syncs before the first GET resolves must produce ONE request,
   // not ten). Apply the cached chip only once we actually have an effort value.
   if(_lastReasoningFetchKey===key){
-    if(_currentReasoningEffort!==null) _applyReasoningChip(_currentReasoningEffort);
+    const status=(typeof _currentReasoningStatus==='undefined') ? null : _currentReasoningStatus;
+    if(status) _applyReasoningChip(_currentReasoningEffort, status);
+    else if(_currentReasoningEffort!==null) _applyReasoningChip(_currentReasoningEffort, {
+      reasoning_scope:(typeof _currentReasoningScope==='undefined') ? 'profile' : _currentReasoningScope,
+      supported_efforts:_currentReasoningEffortsSupported||[],
+    });
     return;
   }
   fetchReasoningChip();
 }
 
-function _highlightReasoningOption(effort){
+function _highlightReasoningOption(effort, scope, meta){
+  if(typeof _ensureReasoningDropdownOptions==='function') _ensureReasoningDropdownOptions();
   const dd=$('composerReasoningDropdown');
   if(!dd) return;
+  const normalizeScope=(typeof _normalizeReasoningScope==='function')
+    ? _normalizeReasoningScope
+    : function(s){return s==='session'?'session':'profile';};
+  const normalizeEffort=(typeof _normalizeReasoningEffort==='function')
+    ? _normalizeReasoningEffort
+    : function(e){return String(e||'').trim().toLowerCase();};
+  const status=(meta&&typeof meta==='object')
+    ? meta
+    : ((typeof _currentReasoningStatus!=='undefined' && _currentReasoningStatus) ? _currentReasoningStatus : null);
+  const normScope=normalizeScope(scope);
+  // Highlight each group by its own real value so both stay truthful when a
+  // session override masks the profile default (and vice versa).
+  const hasOverride=status
+    ? !!status.has_session_reasoning_override
+    : normScope==='session';
+  const sessionEffort=(status&&status.session_reasoning_effort!=null)
+    ? normalizeEffort(status.session_reasoning_effort)
+    : (normScope==='session' ? normalizeEffort(effort) : null);
+  const profileEffort=(status&&status.profile_reasoning_effort!=null)
+    ? normalizeEffort(status.profile_reasoning_effort)
+    : (normScope==='profile' ? normalizeEffort(effort) : null);
   dd.querySelectorAll('.reasoning-option').forEach(function(opt){
-    opt.classList.toggle('selected',opt.dataset.effort===effort);
+    const optScope=normalizeScope(opt.dataset.scope);
+    if(opt.dataset.clear){
+      // The clear row is the active session state whenever no override is set.
+      opt.classList.toggle('selected', optScope==='session' && !hasOverride);
+      return;
+    }
+    const on=optScope==='session'
+      ? (hasOverride && opt.dataset.effort===sessionEffort)
+      : (profileEffort!=null && opt.dataset.effort===profileEffort);
+    opt.classList.toggle('selected', on);
   });
 }
 
@@ -4496,7 +4630,8 @@ function toggleReasoningDropdown(){
   if(typeof closeWsDropdown==='function') closeWsDropdown();
   closeModelDropdown();
   if(typeof closeToolsetsDropdown==='function') closeToolsetsDropdown();
-  _highlightReasoningOption(_currentReasoningEffort);
+  _ensureReasoningDropdownOptions();
+  _highlightReasoningOption(_currentReasoningEffort, _currentReasoningScope, _currentReasoningStatus);
   dd.classList.add('open');
   _positionReasoningDropdown();
   chip.classList.add('active');
@@ -4529,6 +4664,63 @@ function closeReasoningDropdown(){
   if(mobileAction) mobileAction.classList.remove('active');
 }
 
+function _sendReasoningEffort(scope, effort){
+  const normalizedScope=_normalizeReasoningScope(scope);
+  const payload=Object.assign({effort:effort},_reasoningEffortContext());
+  if(normalizedScope==='profile'){
+    delete payload.session_id;
+  }else if(!payload.session_id){
+    if(typeof showToast==='function') showToast('Select a session before using session-only reasoning.', 3000, 'warning');
+    return Promise.resolve(null);
+  }
+  return api(_reasoningEndpointForScope(normalizedScope),{method:'POST',body:JSON.stringify(payload)})
+    .then(function(st){
+      if(normalizedScope==='profile' && _activeReasoningSessionId()){
+        _lastReasoningFetchKey=null;
+        return api('/api/reasoning'+_reasoningEffortQuery()).then(function(fresh){
+          const applied=fresh||st||{reasoning_scope:normalizedScope};
+          const appliedScope=_normalizeReasoningScope((applied&&applied.reasoning_scope)||normalizedScope);
+          _applyReasoningChip((applied&&applied.reasoning_effort)||effort, applied);
+          if(appliedScope==='session'){
+            // The profile write landed but an active session override still wins,
+            // so name what actually happened instead of announcing the override.
+            const overrideLabel=_formatReasoningEffortLabel((applied&&applied.reasoning_effort)||'');
+            showToast('🧠 Profile default saved: '+_formatReasoningEffortLabel(effort)+'. This conversation keeps its '+overrideLabel+' session override.');
+          }else{
+            showToast('🧠 Reasoning effort set to '+((applied&&applied.reasoning_effort)||effort)+' ('+_formatReasoningScopeLabel(appliedScope).toLowerCase()+')');
+          }
+          return applied;
+        }).catch(function(){
+          const fallbackScope=_normalizeReasoningScope((st&&st.reasoning_scope)||normalizedScope);
+          _applyReasoningChip((st&&st.reasoning_effort)||effort, st||{reasoning_scope:fallbackScope});
+          showToast('🧠 Reasoning effort set to '+((st&&st.reasoning_effort)||effort)+' ('+_formatReasoningScopeLabel(fallbackScope).toLowerCase()+')');
+          return st;
+        });
+      }
+      const nextScope=_normalizeReasoningScope((st&&st.reasoning_scope)||normalizedScope);
+      _applyReasoningChip((st&&st.reasoning_effort)||effort, st||{reasoning_scope:nextScope});
+      showToast('🧠 Reasoning effort set to '+((st&&st.reasoning_effort)||effort)+' ('+_formatReasoningScopeLabel(nextScope).toLowerCase()+')');
+      return st;
+    });
+}
+
+function _clearSessionReasoningEffort(){
+  const sessionId=_activeReasoningSessionId();
+  if(!sessionId){
+    if(typeof showToast==='function') showToast('Select a session before clearing its reasoning override.', 3000, 'warning');
+    return Promise.resolve(null);
+  }
+  const payload=Object.assign({effort:''},_reasoningEffortContext());
+  return api('/api/session/reasoning',{method:'POST',body:JSON.stringify(payload)})
+    .then(function(st){
+      const scope=_normalizeReasoningScope((st&&st.reasoning_scope)||'profile');
+      _applyReasoningChip((st&&st.reasoning_effort)||'', st||{reasoning_scope:scope});
+      const eff=st&&st.reasoning_effort;
+      showToast('🧠 This conversation now follows the profile default'+(eff?' ('+_formatReasoningEffortLabel(eff)+')':''));
+      return st;
+    });
+}
+
 document.addEventListener('click',function(e){
   if(
     !e.target.closest('#composerReasoningChip') &&
@@ -4537,15 +4729,15 @@ document.addEventListener('click',function(e){
   ) closeReasoningDropdown();
   if(e.target.closest('.reasoning-option')){
     const opt=e.target.closest('.reasoning-option');
+    if(opt&&opt.dataset.clear){
+      _clearSessionReasoningEffort().catch(function(){showToast('🧠 Failed to clear session override');});
+      closeReasoningDropdown();
+      return;
+    }
     const effort=opt&&opt.dataset.effort;
+    const scope=opt&&opt.dataset.scope;
     if(effort){
-      const payload=Object.assign({effort:effort},_reasoningEffortContext());
-      api('/api/reasoning',{method:'POST',body:JSON.stringify(payload)})
-        .then(function(st){
-          _applyReasoningChip((st&&st.reasoning_effort)||effort, st||{});
-          showToast('🧠 Reasoning effort set to '+((st&&st.reasoning_effort)||effort));
-        })
-        .catch(function(){showToast('🧠 Failed to set effort');});
+      _sendReasoningEffort(scope, effort).catch(function(){showToast('🧠 Failed to set effort');});
       closeReasoningDropdown();
     }
   }

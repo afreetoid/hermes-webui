@@ -38,6 +38,7 @@ from api.config import (
     resolve_custom_provider_connection,
     model_with_provider_context,
     load_settings,
+    get_reasoning_status,
     parse_reasoning_effort,
     coerce_reasoning_effort_for_model,
     _main_model_request_overrides,
@@ -6327,6 +6328,27 @@ def _refresh_cached_agent_primary_runtime_snapshot(agent) -> None:
             rt['is_anthropic_oauth'] = getattr(agent, '_is_anthropic_oauth')
 
 
+def _resolve_turn_reasoning_config(session, *, model_id=None, provider_id=None, base_url=None, config_data=None):
+    """Return the reasoning_config for the current turn."""
+    try:
+        status = get_reasoning_status(
+            session=session,
+            model_id=model_id,
+            provider_id=provider_id,
+            base_url=base_url,
+            config_data=config_data,
+        )
+        effort = coerce_reasoning_effort_for_model(
+            status.get('reasoning_effort'),
+            model_id,
+            provider_id=provider_id,
+            base_url=base_url,
+        )
+        return parse_reasoning_effort(effort)
+    except Exception:
+        return None
+
+
 def _run_agent_streaming(
     session_id,
     msg_text,
@@ -7728,22 +7750,16 @@ def _run_agent_streaming(
             except Exception:
                 _max_tokens_cfg = None
 
-            # CLI-parity reasoning effort: read agent.reasoning_effort from the
-            # active profile's config.yaml (the same key the CLI writes via
-            # `/reasoning <level>`) and hand the parsed dict to AIAgent.  When
-            # the key is absent or invalid, pass None → agent uses its default.
-            try:
-                _effort_cfg = _cfg.get('agent', {}) if isinstance(_cfg, dict) else {}
-                _effort_raw = _effort_cfg.get('reasoning_effort') if isinstance(_effort_cfg, dict) else None
-                _effort = coerce_reasoning_effort_for_model(
-                    _effort_raw,
-                    resolved_model,
-                    provider_id=resolved_provider,
-                    base_url=resolved_base_url,
-                )
-                _reasoning_config = parse_reasoning_effort(_effort)
-            except Exception:
-                _reasoning_config = None
+            # Resolve the effective reasoning effort through the shared owner
+            # so session overrides win without duplicating the session/profile
+            # decision here.
+            _reasoning_config = _resolve_turn_reasoning_config(
+                s,
+                model_id=resolved_model,
+                provider_id=resolved_provider,
+                base_url=resolved_base_url,
+                config_data=_cfg,
+            )
 
             _agent_kwargs = dict(
                 model=resolved_model,

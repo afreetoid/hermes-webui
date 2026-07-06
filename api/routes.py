@@ -2807,6 +2807,7 @@ from api.config import (
     get_reasoning_status,
     set_reasoning_display,
     set_reasoning_effort,
+    set_session_reasoning_effort,
     create_stream_channel,
     get_webui_session_save_mode,
     STREAM_GOAL_RELATED,
@@ -11616,12 +11617,19 @@ def handle_get(handler, parsed) -> bool:
         model_id = (query.get("model", [""])[0] or "").strip() or None
         provider_id = (query.get("provider", [""])[0] or "").strip() or None
         base_url = (query.get("base_url", [""])[0] or "").strip() or None
+        session_id = (query.get("session_id", [""])[0] or "").strip() or None
+        session = None
+        if session_id:
+            session = get_session(session_id, metadata_only=True)
+            if session is None or not _session_visible_to_active_profile(getattr(session, "profile", None), handler):
+                return bad(handler, "Session not found", 404)
         return j(
             handler,
             get_reasoning_status(
                 model_id=model_id,
                 provider_id=provider_id,
                 base_url=base_url,
+                session=session,
             ),
         )
 
@@ -13265,6 +13273,7 @@ def handle_post(handler, parsed) -> bool:
                 # re-derive on the next turn.
                 personality=session.personality,
                 enabled_toolsets=getattr(session, "enabled_toolsets", None),
+                reasoning_effort=getattr(session, "reasoning_effort", None),
                 context_length=getattr(session, "context_length", None),
                 threshold_tokens=getattr(session, "threshold_tokens", None),
                 truncation_watermark=getattr(session, "truncation_watermark", None),
@@ -13411,6 +13420,35 @@ def handle_post(handler, parsed) -> bool:
                     ),
                 )
             return bad(handler, "reasoning: must supply 'display' or 'effort'")
+        except ValueError as e:
+            return bad(handler, str(e))
+        except RuntimeError as e:
+            return bad(handler, str(e), 500)
+
+    if parsed.path == "/api/session/reasoning":
+        try:
+            require(body, "session_id")
+        except ValueError as e:
+            return bad(handler, str(e))
+        sid = str(body.get("session_id") or "").strip()
+        if not sid:
+            return bad(handler, "session_id is required")
+        session = get_session(sid)
+        if session is None:
+            return bad(handler, "Session not found", 404)
+        if not _session_visible_to_active_profile(getattr(session, "profile", None), handler):
+            return bad(handler, "Session not found", 404)
+        try:
+            return j(
+                handler,
+                set_session_reasoning_effort(
+                    session,
+                    body.get("effort"),
+                    model_id=str(body.get("model") or "").strip() or None,
+                    provider_id=str(body.get("provider") or "").strip() or None,
+                    base_url=str(body.get("base_url") or "").strip() or None,
+                ),
+            )
         except ValueError as e:
             return bad(handler, str(e))
         except RuntimeError as e:
@@ -14016,6 +14054,7 @@ def handle_post(handler, parsed) -> bool:
             project_id=getattr(source, "project_id", None),
             personality=getattr(source, "personality", None),
             enabled_toolsets=getattr(source, "enabled_toolsets", None),
+            reasoning_effort=getattr(source, "reasoning_effort", None),
             context_length=getattr(source, "context_length", None),
             threshold_tokens=getattr(source, "threshold_tokens", None),
             # context_messages — truncated to fork prefix (not full parent copy)
@@ -19952,6 +19991,7 @@ def _handle_session_compression_recovery_start(handler, body):
                 session_source="fork",
                 personality=getattr(source, "personality", None),
                 enabled_toolsets=copy.deepcopy(getattr(source, "enabled_toolsets", None)),
+                reasoning_effort=getattr(source, "reasoning_effort", None),
                 context_length=getattr(source, "context_length", None),
                 threshold_tokens=getattr(source, "threshold_tokens", None),
                 gateway_routing=copy.deepcopy(getattr(source, "gateway_routing", None)),

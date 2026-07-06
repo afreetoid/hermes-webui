@@ -101,8 +101,31 @@ def _gateway_use_runs_api_enabled(config_data=None, environ: dict[str, str] | No
     return raw in ("1", "true", "yes", "on")
 
 
-def _gateway_reasoning_effort_for_request(cfg, *, model=None, model_provider=None):
+def _gateway_reasoning_effort_for_request(
+    cfg,
+    *,
+    model=None,
+    model_provider=None,
+    session=None,
+    base_url=None,
+):
     """Read and coerce user-configured reasoning effort for a gateway request."""
+    try:
+        from api.config import get_reasoning_status
+
+        status = get_reasoning_status(
+            model_id=model,
+            provider_id=model_provider,
+            base_url=base_url,
+            session=session,
+            config_data=cfg,
+        )
+        if isinstance(status, dict):
+            effort = status.get("reasoning_effort")
+            if effort:
+                return str(effort)
+    except Exception:
+        pass
     try:
         cfg_data = cfg if isinstance(cfg, dict) else {}
         effort_cfg = cfg_data.get("agent", {}) if isinstance(cfg_data, dict) else {}
@@ -571,13 +594,20 @@ def _run_gateway_chat_streaming(
     usage = {"input_tokens": 0, "output_tokens": 0, "estimated_cost": 0}
     try:
         s = get_session(session_id)
-        from api.config import get_config  # imported lazily to avoid config-cycle churn
+        from api.config import get_config, get_config_for_profile_home  # imported lazily to avoid config-cycle churn
+        from api.profiles import get_hermes_home_for_profile
 
-        cfg = get_config()
+        try:
+            cfg = get_config_for_profile_home(get_hermes_home_for_profile(getattr(s, "profile", None)))
+        except Exception:
+            cfg = get_config()
+        base_url = _gateway_base_url(cfg)
         reasoning_effort = _gateway_reasoning_effort_for_request(
             cfg,
             model=model,
             model_provider=model_provider,
+            session=s,
+            base_url=base_url,
         )
         try:
             from api.streaming import (
@@ -617,7 +647,6 @@ def _run_gateway_chat_streaming(
         except Exception:
             logger.debug("Failed to load WebUI gateway prefill context", exc_info=True)
             prefill_messages = []
-        base_url = _gateway_base_url(cfg)
         api_key = _gateway_api_key()
         try:
             from api.config import _main_model_request_overrides
