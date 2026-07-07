@@ -8,12 +8,8 @@ text to the next tool-result message — no interruption.
 Falls back to {"accepted": false, "fallback": "<reason>"} when the agent
 isn't running, isn't cached, or doesn't support steer (older agent versions).
 The frontend uses the fallback signal to restore the draft without cancelling
-the active run.
-
-Plus a leftover-delivery flow: if the agent finishes its turn before the
-steer is consumed (no tool-call boundary), _drain_pending_steer is called
-after run_conversation returns and a `pending_steer_leftover` SSE event is
-emitted so the frontend can queue the leftover text as a next-turn message.
+the active run. Gateway-owned runs have no cached WebUI agent, so their
+fallback tells the frontend to queue the text as the next turn.
 """
 import sys
 import os
@@ -40,14 +36,24 @@ def _restore_auth_sessions():
 
 @pytest.fixture
 def _clear_caches():
-    """Snapshot SESSION_AGENT_CACHE and STREAMS so tests don't bleed."""
-    from api.config import SESSION_AGENT_CACHE, SESSION_AGENT_CACHE_LOCK, STREAMS, STREAMS_LOCK
+    """Snapshot live-run caches so tests don't bleed."""
+    from api.config import (
+        ACTIVE_RUNS,
+        ACTIVE_RUNS_LOCK,
+        SESSION_AGENT_CACHE,
+        SESSION_AGENT_CACHE_LOCK,
+        STREAMS,
+        STREAMS_LOCK,
+    )
     with SESSION_AGENT_CACHE_LOCK:
         cache_snap = dict(SESSION_AGENT_CACHE)
         SESSION_AGENT_CACHE.clear()
     with STREAMS_LOCK:
         streams_snap = dict(STREAMS)
         STREAMS.clear()
+    with ACTIVE_RUNS_LOCK:
+        active_runs_snap = dict(ACTIVE_RUNS)
+        ACTIVE_RUNS.clear()
     yield
     with SESSION_AGENT_CACHE_LOCK:
         SESSION_AGENT_CACHE.clear()
@@ -55,6 +61,9 @@ def _clear_caches():
     with STREAMS_LOCK:
         STREAMS.clear()
         STREAMS.update(streams_snap)
+    with ACTIVE_RUNS_LOCK:
+        ACTIVE_RUNS.clear()
+        ACTIVE_RUNS.update(active_runs_snap)
 
 
 def _make_handler():
@@ -121,6 +130,48 @@ class TestHandleChatSteerFallbacks:
         body = _captured_response(handler)
         assert body["accepted"] is False
         assert body["fallback"] == "no_cached_agent"
+
+    def test_gateway_run_steer_queues_without_cached_agent(self, _clear_caches):
+        from api.config import ACTIVE_RUNS, ACTIVE_RUNS_LOCK, STREAMS, STREAMS_LOCK
+        from api.streaming import _handle_chat_steer
+        import queue as _q
+        sid, stream_id = "sid_gateway", "stream_gateway"
+        with ACTIVE_RUNS_LOCK:
+            ACTIVE_RUNS[stream_id] = {"session_id": sid, "backend": "gateway"}
+        with STREAMS_LOCK:
+            STREAMS[stream_id] = _q.Queue()
+        sess = MagicMock()
+        sess.active_stream_id = stream_id
+
+        with patch("api.streaming.get_session", return_value=sess):
+            handler = _make_handler()
+            _handle_chat_steer(handler, {"session_id": sid, "text": "Use Python instead"})
+
+        assert _captured_response(handler) == {
+            "accepted": False,
+            "fallback": "gateway_steer_queued",
+            "stream_id": stream_id,
+        }
+
+    def test_legacy_gateway_stream_without_run_id_still_queues(self, _clear_caches):
+        from api.config import ACTIVE_RUNS, ACTIVE_RUNS_LOCK, STREAMS, STREAMS_LOCK
+        from api.gateway_chat import _STREAM_RUN_IDS
+        from api.streaming import _handle_chat_steer
+        import queue as _q
+        sid, stream_id = "sid_gateway_legacy", "stream_gateway_legacy"
+        _STREAM_RUN_IDS.pop(stream_id, None)
+        with ACTIVE_RUNS_LOCK:
+            ACTIVE_RUNS[stream_id] = {"session_id": sid, "backend": "gateway"}
+        with STREAMS_LOCK:
+            STREAMS[stream_id] = _q.Queue()
+        sess = MagicMock()
+        sess.active_stream_id = stream_id
+
+        with patch("api.streaming.get_session", return_value=sess):
+            handler = _make_handler()
+            _handle_chat_steer(handler, {"session_id": sid, "text": "Use Python instead"})
+
+        assert _captured_response(handler)["fallback"] == "gateway_steer_queued"
 
     def test_agent_lacks_steer_method(self, _clear_caches):
         from api.streaming import _handle_chat_steer
@@ -254,6 +305,7 @@ class TestFrontendWiring:
         cls.cmds = (Path(__file__).parent.parent / "static" / "commands.js").read_text(encoding="utf-8")
         cls.msgs = (Path(__file__).parent.parent / "static" / "messages.js").read_text(encoding="utf-8")
         cls.i18n = (Path(__file__).parent.parent / "static" / "i18n.js").read_text(encoding="utf-8")
+        cls.sessions = (Path(__file__).parent.parent / "static" / "sessions.js").read_text(encoding="utf-8")
 
     def test_cmd_steer_calls_endpoint(self):
         idx = self.cmds.find("async function cmdSteer(")
@@ -272,11 +324,18 @@ class TestFrontendWiring:
     def test_try_steer_handles_fallback_without_cancelling(self):
         idx = self.cmds.find("async function _trySteer(")
         body = _source_between(self.cmds, "async function _trySteer(", "\nasync function cmdTitle")
-        # Must check result.accepted and surface fallback without queueing or cancelling.
+        # Must check result.accepted and surface fallback without cancelling.
         assert "result&&result.accepted" in body or "result.accepted" in body
-        assert "queueSessionMessage" not in body
+        assert "gateway_steer_queued" in body
+        assert "queueSessionMessage" in body
+        assert "ownerSid" in body
+        assert "ownerFiles" in body
         assert "cancelStream" not in body, "fallback path must not cancel the stream"
-        assert "inp.value" in body, "fallback path must restore the composer draft"
+        # Draft restore on failure now routes through the guarded helper so it never
+        # clobbers replacement content typed/staged during the await.
+        assert "_steerRestoreDraftOnFailure(ownerSid,originalMsg,explicitSteer,pendingFilesSnapshot)" in body, (
+            "fallback path must restore the composer draft via the guarded helper"
+        )
 
     def test_send_busy_steer_uses_try_steer(self):
         # send() in messages.js: when busyMode === 'steer', should call _trySteer
@@ -302,9 +361,13 @@ class TestFrontendWiring:
         assert "body:JSON.stringify({session_id:ownerSid,text:steerText})" in body, (
             "steer endpoint must receive the captured owner session id and attachment-enriched text"
         )
-        assert "_clearComposerDraft(ownerSid,_steerRestoreText(originalMsg,explicitSteer),pendingFilesSnapshot)" in body
+        # Composer cleanup (draft clear + delivered-file removal) is owned by the
+        # shared _steerFinalizeComposer guard, not _trySteer itself.
+        assert "_clearComposerDraft(" not in body, "draft clearing must route through _steerFinalizeComposer, not _trySteer"
+        assert "return {handled:true,queuedFallback:false,ownerSid,files:ownerFiles};" in body
         assert "if(_steerOwnerIsCurrent(ownerSid))" in body
-        assert "S.pendingFiles=_remaining" in body, "accepted steer should clear the delivered files (by identity) after paths are injected"
+        finalize = _source_between(cmds, "function _steerFinalizeComposer", "\nfunction _showSteerRecovery")
+        assert "S.pendingFiles=_remaining" in finalize, "the shared guard removes the delivered files by identity"
 
     def test_file_steer_does_not_read_live_session_after_upload_await(self):
         cmds = self.cmds
@@ -376,7 +439,8 @@ class TestFrontendWiring:
             eval({json.dumps(steer_src)});
             (async()=>{{
               const delivered = await _trySteer('hint', false);
-              assert.strictEqual(delivered, true);
+              assert.strictEqual(delivered.handled, true);
+              assert.strictEqual(delivered.queuedFallback, false);
               assert.strictEqual(indicatorText, 'hint');
               assert.ok(apiPayload.text.includes('[Attached files for this steer: /tmp/a.pdf]'));
               assert.ok(!indicatorText.includes('Attached files'));
@@ -425,7 +489,8 @@ class TestFrontendWiring:
             eval({json.dumps(steer_src)});
             (async()=>{{
               const delivered = await _trySteer('', false);
-              assert.strictEqual(delivered, true);
+              assert.strictEqual(delivered.handled, true);
+              assert.strictEqual(delivered.queuedFallback, false);
               assert.strictEqual(indicatorText, 'Attached files: a.pdf');
               assert.ok(apiPayload.text.includes('[Attached files for this steer: /tmp/a.pdf]'));
               assert.ok(!indicatorText.includes('file tools/read_file'));
@@ -445,10 +510,19 @@ class TestFrontendWiring:
             pytest.skip("node not available")
         assert node is not None
 
+        # Include the shared cleanup guard: draft clearing moved out of _trySteer
+        # into _steerFinalizeComposer, which the caller runs after _trySteer returns.
         steer_src = _source_between(
             self.cmds,
-            "function _steerUploadedAttachmentPaths",
+            "function _steerComposerSafeToClear",
             "\nasync function cmdTitle",
+        )
+        # Real signature helpers so the non-current-owner clear is authorized by the
+        # owner's persisted-draft evidence, exactly as production computes it.
+        sig_src = _source_between(
+            self.sessions,
+            "function _composerDraftFileSignature(file)",
+            "function _composerDraftPayloadSignatureForSid(sid)",
         )
         script = textwrap.dedent(
             f"""
@@ -464,11 +538,22 @@ class TestFrontendWiring:
             function setComposerStatus(){{}}
             function showToast(){{}}
             function renderTray(){{trayRenders += 1;}}
+            function autoResize(){{}}
+            function updateSendBtn(){{}}
             function _showSteerIndicator(){{indicatorCalls += 1;}}
             function _showSteerRecovery(){{}}
             function _clearComposerDraft(sid,text,files){{draftClears.push({{sid,text,files}});}}
+            {sig_src}
+            let _persistedDrafts = {{}};
+            function _composerDraftLastPersistedForSid(sid){{
+              return Object.prototype.hasOwnProperty.call(_persistedDrafts, sid) ? _persistedDrafts[sid] : null;
+            }}
             async function uploadPendingFiles(options){{
               uploadOptions = options;
+              // The mid-upload switch A->B runs loadSession, which persists A's live
+              // composer via _saveComposerDraftNow. The busy-send path cleared the
+              // text on submit, so the unedited steer echo is {{text:'', files:[a.pdf]}}.
+              _persistedDrafts['A'] = {{text:'', files:[{{name:'a.pdf'}}]}};
               S.session = {{session_id:'B'}};
               S.pendingFiles = [{{name:'b.pdf'}}];
               return [{{path:'/tmp/a.pdf'}}];
@@ -481,7 +566,11 @@ class TestFrontendWiring:
             eval({json.dumps(steer_src)});
             (async()=>{{
               const delivered = await _trySteer('hint', false);
-              assert.strictEqual(delivered, true);
+              // Caller runs the shared cleanup for the captured owner ('A'), which is
+              // no longer the live session ('B') after the mid-upload switch.
+              _steerFinalizeComposer(delivered.ownerSid, 'hint', delivered.files, false);
+              assert.strictEqual(delivered.handled, true);
+              assert.strictEqual(delivered.queuedFallback, false);
               assert.strictEqual(uploadOptions.sessionId, 'A');
               assert.strictEqual(uploadOptions.files.length, 1);
               assert.strictEqual(uploadOptions.files[0].name, 'a.pdf');
@@ -499,6 +588,60 @@ class TestFrontendWiring:
         )
         subprocess.run([node, "-e", script], check=True, capture_output=True, text=True)
 
+    def test_gateway_queued_cleanup_clears_unchanged_composer_text(self):
+        import json
+        import shutil
+        import subprocess
+        import textwrap
+
+        node = shutil.which("node")
+        if not node:  # pragma: no cover
+            pytest.skip("node not available")
+        assert node is not None
+
+        cleanup_src = _source_between(
+            self.cmds,
+            "function _steerComposerSafeToClear",
+            "\nfunction _showSteerRecovery",
+        )
+        script = textwrap.dedent(
+            f"""
+            const assert = require('assert');
+            let S = {{session:{{session_id:'A'}}, pendingFiles:[{{name:'a.pdf'}}]}};
+            let trayRenders = 0;
+            let resized = 0;
+            let sendUpdates = 0;
+            let draftClears = [];
+            const msgEl = {{value:'/steer retry me'}};
+            function $(id){{assert.strictEqual(id, 'msg'); return msgEl;}}
+            function renderTray(){{trayRenders += 1;}}
+            function autoResize(){{resized += 1;}}
+            function updateSendBtn(){{sendUpdates += 1;}}
+            function _clearComposerDraft(sid,text,files){{draftClears.push({{sid,text,files}});}}
+            function _steerOwnerIsCurrent(sid){{return !!(sid && S && S.session && S.session.session_id===sid);}}
+            function _steerRestoreText(msg,explicit){{return explicit?('/steer '+msg):msg;}}
+            eval({json.dumps(cleanup_src)});
+            // Unchanged composer (still holds the submitted `/steer retry me`): all
+            // three surfaces clear.
+            _steerFinalizeComposer('A', 'retry me', S.pendingFiles, false);
+            assert.strictEqual(msgEl.value, '');
+            assert.strictEqual(S.pendingFiles.length, 0);
+            assert.strictEqual(trayRenders, 1);
+            assert.strictEqual(resized, 1);
+            assert.strictEqual(sendUpdates, 1);
+            assert.strictEqual(draftClears.length, 1);
+            // Replacement text typed during the await: textarea AND persisted draft
+            // are both preserved.
+            msgEl.value = 'new text';
+            _steerFinalizeComposer('A', 'retry me', [], false);
+            assert.strictEqual(msgEl.value, 'new text');
+            assert.strictEqual(resized, 1);
+            assert.strictEqual(sendUpdates, 1);
+            assert.strictEqual(draftClears.length, 1);
+            """
+        )
+        subprocess.run([node, "-e", script], check=True, capture_output=True, text=True)
+
     def test_send_busy_steer_accepts_file_only_input(self):
         idx = self.msgs.find("if(S.busy||compressionRunning)")
         assert idx >= 0
@@ -506,7 +649,7 @@ class TestFrontendWiring:
         assert "if(text||S.pendingFiles.length)" in block, (
             "busy send must route file-only composer submissions through queue/interrupt/steer"
         )
-        assert "_trySteer uploads with clearPending=false" in self.msgs
+        assert "a failed steer restores the draft" in self.msgs
 
     def test_upload_pending_files_can_preserve_staged_files_for_steer(self):
         ui = (Path(__file__).parent.parent / "static" / "ui.js").read_text(encoding="utf-8")

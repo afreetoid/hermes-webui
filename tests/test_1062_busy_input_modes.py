@@ -102,19 +102,27 @@ class TestSlashCommandHandlers:
         idx = COMMANDS_JS.find("async function cmdSteer(")
         assert idx >= 0
         body = COMMANDS_JS[idx:idx + 800]
-        # cmdSteer delegates to _trySteer; fallback must not queue+cancel.
+        # cmdSteer delegates to _trySteer; fallback must not cancel the stream.
         assert "_trySteer" in body, "cmdSteer must call _trySteer to use the real /api/chat/steer endpoint"
         # The shared helper must contain the non-destructive fallback path.
         helper_idx = COMMANDS_JS.find("async function _trySteer(")
         assert helper_idx >= 0, "_trySteer helper must exist"
         helper_body = _source_between(COMMANDS_JS, "async function _trySteer(", "\nasync function cmdTitle")
-        assert "queueSessionMessage" not in helper_body
+        assert "queueSessionMessage" in helper_body
         assert "cancelStream" not in helper_body
-        assert "inp.value" in helper_body
+        assert "_steerRestoreDraftOnFailure(" in helper_body
         assert "if(result&&result.accepted)" in helper_body
-        assert "S.pendingFiles=_remaining" in helper_body
+        assert "return {handled:true,queuedFallback:false,ownerSid,files:ownerFiles};" in helper_body
         # Toast should differ from interrupt to signal it's the steer path
         assert "_steerFailureMessageKey" in helper_body or "steer_fail_" in helper_body
+
+    def test_try_steer_queues_gateway_fallback(self):
+        helper_idx = COMMANDS_JS.find("async function _trySteer(")
+        assert helper_idx >= 0
+        helper_body = _source_between(COMMANDS_JS, "async function _trySteer(", "\nasync function cmdTitle")
+        assert "gateway_steer_queued" in helper_body
+        assert "queueSessionMessage" in helper_body
+        assert "cancelStream" not in helper_body
 
 
 # ── send() busy branch ───────────────────────────────────────────────────
@@ -124,8 +132,9 @@ class TestSlashCommandHandlers:
         preserves staged files so the user can choose the next explicit action.
 
         cmdQueue and cmdInterrupt call queueSessionMessage themselves and clear
-        S.pendingFiles directly. cmdSteer delegates to _trySteer. _trySteer no
-        longer clears files on failure because it no longer falls back to
+        S.pendingFiles directly. cmdSteer delegates to _trySteer and clears
+        only when the gateway fallback consumed the captured files. _trySteer
+        no longer clears files on failure because it no longer falls back to
         cancel-and-queue behavior.
         """
         # cmdQueue and cmdInterrupt clear pendingFiles directly
@@ -140,21 +149,45 @@ class TestSlashCommandHandlers:
                 f"{fn_name} must call renderTray() after clearing pendingFiles"
             )
         # cmdSteer delegates to _trySteer; the helper clears files only on
-        # accepted steer, and (post-#5459-gate) removes ONLY the delivered files
-        # by identity so files staged during the upload await are preserved. The
-        # fallback path restores the draft and keeps staged files available.
+        # accepted steer, and removes only the delivered files by identity so
+        # files staged during the upload await are preserved. The fallback path
+        # restores the draft and keeps staged files available.
+        # File removal and draft clearing on accepted steer now live in the shared
+        # _steerFinalizeComposer guard (run by the caller after _trySteer returns).
+        # _trySteer itself must not mutate staged files or the draft.
         try_body = _source_between(COMMANDS_JS, "async function _trySteer(", "\nasync function cmdTitle")
         accepted_idx = try_body.find("if(result&&result.accepted)")
         failure_idx = try_body.find("// Do not fall back to interrupt")
-        # Identity-based removal of the delivered snapshot on accepted steer.
-        clear_idx = try_body.find("S.pendingFiles=_remaining", accepted_idx)
         assert accepted_idx >= 0, "_trySteer must branch on accepted steer responses"
-        assert clear_idx > accepted_idx, "accepted steer should clear the delivered staged files"
-        assert "_delivered=new Set(pendingFilesSnapshot)" in try_body, (
-            "accepted steer must remove only the delivered files by identity, preserving newly staged ones"
+        assert "S.pendingFiles=_remaining" not in try_body
+        assert "S.pendingFiles=[]" not in try_body
+        assert "_clearComposerDraft(" not in try_body, "steer draft clearing must route through the shared guard"
+        assert "_steerRestoreDraftOnFailure(" in try_body[failure_idx:], "failure path restores the owner draft via the guarded helper"
+
+        finalize_body = _source_between(COMMANDS_JS, "function _steerFinalizeComposer", "\nfunction _showSteerRecovery")
+        assert "_delivered=new Set(delivered)" in finalize_body, (
+            "the shared guard removes only the delivered files by identity, preserving newly staged ones"
         )
-        assert failure_idx > clear_idx, "staged files must not be cleared in the failure path"
-        assert "renderTray()" in try_body[failure_idx:]
+        assert "S.pendingFiles=_remaining" in finalize_body
+
+        idx_steer = COMMANDS_JS.find("async function cmdSteer(")
+        assert idx_steer >= 0, "cmdSteer not found"
+        steer_body = COMMANDS_JS[idx_steer:COMMANDS_JS.find("function _steerFailureMessageKey", idx_steer)]
+        assert "_steerFinalizeComposer(_steerResult.ownerSid,msg,_steerResult.files,/*explicitSteer=*/true)" in steer_body
+        predicate_body = _source_between(COMMANDS_JS, "function _steerComposerSafeToClear", "\nfunction _steerFinalizeComposer")
+        assert "inp.value===text" in predicate_body
+        assert "inp.value===`/steer ${text}`" in predicate_body
+        assert "staged.every(f=>submitted.has(f))" in predicate_body, "the safe-clear predicate must consider staged files, not just text"
+        assert "_steerComposerSafeToClear(ownerSid,msg,delivered)" in finalize_body
+        assert "if(!safe)return;" in finalize_body
+        assert "updateSendBtn()" in finalize_body
+        assert "_clearComposerDraft(ownerSid,_steerRestoreText(msg,explicitSteer),delivered)" in finalize_body
+
+    def test_steer_recovery_retry_consumes_queued_fallback_cleanup(self):
+        recovery_body = _source_between(COMMANDS_JS, "function _showSteerRecovery", "\n/**")
+        assert "retryBtn.addEventListener('click', async () => {" in recovery_body
+        assert "const result=await _trySteer(msg, explicitSteer).catch" in recovery_body
+        assert "_steerFinalizeComposer(result.ownerSid,msg,result.files,explicitSteer)" in recovery_body
 
 
 class TestBusySendButton:
@@ -326,17 +359,19 @@ class TestSendBusyBranchDispatch:
         branch_end = MESSAGES_JS.find("} else if(defaultMessageMode==='interrupt')", steer_idx)
         assert branch_end > steer_idx, "busy steer branch end not found"
         branch = MESSAGES_JS[steer_idx:branch_end]
-        assert "await _trySteer(text, /*explicitSteer=*/false)" in branch
-        assert "_trySteer captures the owner session/files before awaiting uploads" in branch
-        assert "_trySteer clears staged files only after /api/chat/steer accepts" in branch
-        assert "_clearComposerDraft(S.session.session_id,text" not in branch
+        assert "const _steerResult=await _trySteer" in branch
+        # Busy-send routes delivered/queued cleanup through the shared guard, which only
+        # clears files/textarea/draft when the composer still holds the submitted payload.
+        assert "_steerFinalizeComposer(_steerResult.ownerSid,text,_steerResult.files,/*explicitSteer=*/false)" in branch
+        assert "_steerResult.handled" in branch
+        assert branch.index("const _steerResult=await _trySteer") < branch.index("_steerFinalizeComposer(")
+        # Failed steer (not handled) never reaches the guard, so staged files stay intact.
         try_body = _source_between(COMMANDS_JS, "async function _trySteer(", "\nasync function cmdTitle")
         accepted_idx = try_body.find("if(result&&result.accepted)")
         failure_idx = try_body.find("// Do not fall back to interrupt")
-        clear_idx = try_body.find("S.pendingFiles=_remaining", accepted_idx)
-        assert accepted_idx >= 0 and clear_idx > accepted_idx
-        assert "_clearComposerDraft(ownerSid,_steerRestoreText(originalMsg,explicitSteer),pendingFilesSnapshot)" in try_body
-        assert failure_idx > clear_idx, "failed steer must leave staged files intact"
+        assert accepted_idx >= 0 and failure_idx > accepted_idx
+        assert "S.pendingFiles=_remaining" not in try_body, "file cleanup moved to the shared guard"
+        assert "_steerRestoreDraftOnFailure(" in try_body[failure_idx:], "failed steer restores the owner draft without clearing files"
 
     def test_reentrant_send_does_not_queue_staged_files_while_steer_uploads(self):
         """Repeated Enter during steer upload must not double-send staged files.
@@ -362,15 +397,12 @@ class TestSendBusyBranchDispatch:
         ONLY the delivered files by identity, preserving files staged during the
         upload/API await."""
         try_body = _source_between(COMMANDS_JS, "async function _steerTextWithPendingFiles(", "\nasync function cmdTitle")
-        # (1) upload cache keyed by session + file signature, reused on retry,
-        # invalidated on delivery.
         assert "_steerUploadCache" in try_body
         assert "_steerFilesSignature(" in try_body
         assert "_steerUploadCache={sid:ownerSid,sig,paths}" in try_body
         assert "_steerUploadCache=null" in try_body
-        # (2) identity-based removal of only the delivered snapshot.
-        assert "_delivered=new Set(pendingFilesSnapshot)" in try_body
-        assert "S.pendingFiles=_remaining" in try_body
+        assert "_delivered=new Set(delivered)" in COMMANDS_JS
+        assert "S.pendingFiles=_remaining" in COMMANDS_JS
 
 
     def test_slash_commands_intercepted_before_busymode_routing(self):

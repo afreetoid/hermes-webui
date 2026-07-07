@@ -1372,17 +1372,19 @@ async function send(){
       }
     const defaultMessageMode=window._defaultMessageMode||'steer';
       if(defaultMessageMode==='steer'&&S.activeStreamId&&typeof _trySteer==='function'){
-        // Real steer: clear the input first so the user gets immediate
-        // feedback, then ship the steer payload via /api/chat/steer.
-        // _trySteer captures the owner session/files before awaiting uploads,
-        // restores/persists the draft on failure, and clears the owner draft
-        // only after /api/chat/steer accepts.
+        // Real steer: clear the input first (synchronous, pre-await, so no
+        // replacement content can exist yet) for immediate feedback, then ship the
+        // steer payload via /api/chat/steer. _trySteer captures the owner
+        // session/files before awaiting uploads and restores/persists the draft on
+        // failure.
         $('msg').value='';autoResize();
-        // Do NOT clear pendingFiles yet — _trySteer uploads with clearPending=false,
-        // and a failed steer must keep staged files available for the user's next explicit action.
-        await _trySteer(text, /*explicitSteer=*/false);
-        // _trySteer clears staged files only after /api/chat/steer accepts, and
-        // only when the visible session still matches the captured owner sid.
+        // Do NOT clear pendingFiles yet — a failed steer restores the draft and
+        // must keep staged files available for the user's next explicit action.
+        const _steerResult=await _trySteer(text, /*explicitSteer=*/false);
+        // Delivered/queued steer cleanup (draft, textarea, and delivered files) routes
+        // through the shared guard so replacement text or files typed during the await
+        // are preserved on this path exactly as on the /steer and retry paths.
+        if(_steerResult&&_steerResult.handled&&typeof _steerFinalizeComposer==='function') _steerFinalizeComposer(_steerResult.ownerSid,text,_steerResult.files,/*explicitSteer=*/false);
       } else if(defaultMessageMode==='interrupt'){
         // Queue the message, then cancel so drain re-sends it.
         const _modelState=_chatPayloadModelState();
