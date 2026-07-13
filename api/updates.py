@@ -1130,9 +1130,17 @@ def _check_repo_branch(path, name, *, fetch=True, remote='origin'):
 
     # Fetch latest from the selected remote (network call, cached by TTL).
     if fetch:
-        _, fetch_ok = _run_git(['fetch', remote, '--quiet'], path, timeout=15)
+        fetch_out, fetch_ok = _run_git(['fetch', remote, '--quiet'], path, timeout=15)
         if not fetch_ok:
-            return {'name': name, 'behind': 0, 'error': 'fetch failed'}
+            message = 'fetch failed'
+            if fetch_out:
+                message = f'{message}: {_sanitize_git_diagnostic(fetch_out)}'
+            return {
+                'name': name,
+                'behind': None,
+                'error': message,
+                'stale_check': True,
+            }
 
     if remote == 'origin':
         # Use the current branch's tracking branch for ordinary installations.
@@ -1151,7 +1159,18 @@ def _check_repo_branch(path, name, *, fetch=True, remote='origin'):
 
     # Count commits behind
     out, ok = _run_git(['rev-list', '--count', f'HEAD..{compare_ref}'], path)
-    behind = int(out) if ok and out.isdigit() else 0
+    if not ok or not out.isdigit():
+        message = 'comparison failed'
+        if out:
+            message = f'{message}: {_sanitize_git_diagnostic(out)}'
+        return {
+            'name': name,
+            'behind': None,
+            'branch': compare_ref,
+            'error': message,
+            'stale_check': True,
+        }
+    behind = int(out)
 
     # Get short SHAs for display.
     #
