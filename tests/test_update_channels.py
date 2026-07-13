@@ -151,11 +151,7 @@ def test_agent_repo_falls_through_to_branch_even_on_stable(channel_repo):
 
 
 def test_agent_resolution_identical_under_both_webui_channels(tmp_path, monkeypatch):
-    """Codex gate: the update CHANNEL is WebUI-only. An Agent repo that tags only
-    plain v* must resolve release/apply IDENTICALLY whether the user's WebUI
-    channel is 'stable' or 'experimental' — the webui channel must never leak
-    into the agent check (which would make the agent ignore its v* tags and fall
-    back to origin/master)."""
+    """The Agent check stays channel-neutral and uses the vendor remote."""
     agent = tmp_path / 'agent'
     agent.mkdir()
     _git(agent, 'init', '-q')
@@ -168,10 +164,21 @@ def test_agent_resolution_identical_under_both_webui_channels(tmp_path, monkeypa
     _git(agent, 'tag', 'v1.0.3')            # agent has ONLY plain v* tags, no exp-v*
     _git(agent, 'checkout', '-q', 'v1.0.0')  # behind by one release
 
-    # check_for_updates threads the user's WebUI channel; the agent leg must
-    # ignore it. Compare agent payloads under stable vs experimental WebUI.
+    calls = []
+
+    def fake_check_repo(path, name, channel='stable', check_remote='origin'):
+        calls.append((name, channel, check_remote))
+        return {
+            'name': name,
+            'behind': 1,
+            'branch': f'{check_remote}/main',
+        }
+
+    # check_for_updates threads the user's WebUI channel; the Agent leg must
+    # remain stable/channel-neutral while both targets use the vendor remote.
     monkeypatch.setattr(updates, 'REPO_ROOT', tmp_path / 'nonexistent-webui')
     monkeypatch.setattr(updates, '_AGENT_DIR', agent)
+    monkeypatch.setattr(updates, '_check_repo', fake_check_repo)
 
     def fresh_cache():
         monkeypatch.setitem(updates._update_cache, 'checked_at', 0)
@@ -181,11 +188,11 @@ def test_agent_resolution_identical_under_both_webui_channels(tmp_path, monkeypa
     fresh_cache()
     experimental = updates.check_for_updates(force=True, include_agent=True, channel='experimental')['agent']
 
-    # Agent must resolve its v1.0.3 release identically on both — never None /
-    # origin/master (which is what leaking 'experimental' into the agent caused).
-    assert stable.get('latest_version') == 'v1.0.3'
-    assert experimental.get('latest_version') == 'v1.0.3'
-    assert stable.get('behind') == experimental.get('behind') == 1
+    assert stable == experimental
+    assert [call for call in calls if call[0] == 'agent'] == [
+        ('agent', 'stable', 'upstream'),
+        ('agent', 'stable', 'upstream'),
+    ]
     # Apply-ref selection for the agent is channel-independent because the apply
     # wrappers force DEFAULT_UPDATE_CHANNEL for target=='agent'. Verified at the
     # raw layer with the default (stable) channel — the agent's v* tag resolves.
@@ -230,8 +237,8 @@ def test_force_update_refuses_rewind_when_ref_is_ancestor(channel_repo, monkeypa
 def test_update_cache_scoped_by_channel(channel_repo, monkeypatch):
     calls = []
 
-    def fake_check_repo(path, name, channel='stable'):
-        calls.append((name, channel))
+    def fake_check_repo(path, name, channel='stable', check_remote='origin'):
+        calls.append((name, channel, check_remote))
         return {'name': name, 'behind': 0, 'channel': channel}
 
     monkeypatch.setattr(updates, 'REPO_ROOT', channel_repo)
@@ -246,8 +253,8 @@ def test_update_cache_scoped_by_channel(channel_repo, monkeypatch):
     assert stable['channel'] == 'stable'
     assert experimental['channel'] == 'experimental'
     # Both channels triggered a real check (no stale cross-channel cache hit).
-    assert ('webui', 'stable') in calls
-    assert ('webui', 'experimental') in calls
+    assert ('webui', 'stable', 'upstream') in calls
+    assert ('webui', 'experimental', 'upstream') in calls
 
 
 # ── Lock-recovery preserves the channel (Codex round-2 SILENT) ───────────────

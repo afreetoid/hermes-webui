@@ -320,8 +320,8 @@ def test_check_for_updates_can_skip_agent_repo(tmp_path):
 
     seen = []
 
-    def fake_check_repo(path, name, channel='stable'):
-        seen.append(name)
+    def fake_check_repo(path, name, channel='stable', check_remote='origin'):
+        seen.append((name, check_remote))
         return {'name': name, 'behind': 2 if name == 'webui' else 9}
 
     cache_defaults = {'webui': None, 'agent': None, 'checked_at': 0, 'include_agent': True, 'channel': 'stable'}
@@ -331,7 +331,7 @@ def test_check_for_updates_can_skip_agent_repo(tmp_path):
          patch.object(updates, '_check_repo', side_effect=fake_check_repo):
         result = updates.check_for_updates(force=True, include_agent=False)
 
-    assert seen == ['webui']
+    assert seen == [('webui', 'upstream')]
     assert result['webui']['behind'] == 2
     assert result['agent'] == {'name': 'agent', 'behind': 0, 'ignored': True}
     assert result['include_agent'] is False
@@ -342,8 +342,8 @@ def test_update_cache_is_scoped_by_agent_inclusion(tmp_path):
     (tmp_path / '.git').mkdir()
     calls = []
 
-    def fake_check_repo(path, name, channel='stable'):
-        calls.append(name)
+    def fake_check_repo(path, name, channel='stable', check_remote='origin'):
+        calls.append((name, check_remote))
         return {'name': name, 'behind': len(calls)}
 
     with patch.dict(updates._update_cache, {'webui': None, 'agent': None, 'checked_at': 0, 'include_agent': True, 'channel': 'stable'}, clear=True), \
@@ -356,7 +356,11 @@ def test_update_cache_is_scoped_by_agent_inclusion(tmp_path):
     assert ignored['agent']['ignored'] is True
     assert included['agent']['name'] == 'agent'
     assert included['agent'].get('ignored') is not True
-    assert calls == ['webui', 'webui', 'agent']
+    assert calls == [
+        ('webui', 'upstream'),
+        ('webui', 'upstream'),
+        ('agent', 'upstream'),
+    ]
 
 
 def test_run_git_returns_stderr_on_failure(tmp_path):

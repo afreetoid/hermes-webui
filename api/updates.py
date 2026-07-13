@@ -1,9 +1,9 @@
 """
 Hermes Web UI -- Self-update checker.
 
-Checks if the webui and hermes-agent git repos are behind their latest
-release tags. Results are cached server-side (30-min TTL) so git fetch runs
-at most twice per hour regardless of client count.
+Checks if the webui and hermes-agent git repos are behind their configured
+release refs or vendor branches. Results are cached server-side (30-min TTL)
+so git fetch runs at most twice per hour regardless of client count.
 
 Skips repos that are not git checkouts (e.g. Docker baked images where
 .git does not exist).
@@ -640,15 +640,15 @@ def _split_remote_ref(ref):
     return remote, branch
 
 
-def _detect_default_branch(path):
-    """Detect the remote default branch (master or main)."""
-    out, ok = _run_git(['symbolic-ref', 'refs/remotes/origin/HEAD'], path)
+def _detect_default_branch(path, remote='origin'):
+    """Detect a remote's default branch (master or main)."""
+    out, ok = _run_git(['symbolic-ref', f'refs/remotes/{remote}/HEAD'], path)
     if ok and out:
         # refs/remotes/origin/master -> master
         return out.split('/')[-1]
     # Fallback: try master, then main
     for branch in ('master', 'main'):
-        _, ok = _run_git(['rev-parse', '--verify', f'origin/{branch}'], path)
+        _, ok = _run_git(['rev-parse', '--verify', f'{remote}/{branch}'], path)
         if ok:
             return branch
     return 'master'
@@ -1125,26 +1125,29 @@ def _check_repo_release(path, name, channel=DEFAULT_UPDATE_CHANNEL):
     }
 
 
-def _check_repo_branch(path, name, *, fetch=True):
-    """Fallback: check if a git repo is behind its upstream branch."""
+def _check_repo_branch(path, name, *, fetch=True, remote='origin'):
+    """Check if a git repo is behind the selected remote branch."""
 
-    # Fetch latest from origin (network call, cached by TTL)
+    # Fetch latest from the selected remote (network call, cached by TTL).
     if fetch:
-        _, fetch_ok = _run_git(['fetch', 'origin', '--quiet'], path, timeout=15)
+        _, fetch_ok = _run_git(['fetch', remote, '--quiet'], path, timeout=15)
         if not fetch_ok:
             return {'name': name, 'behind': 0, 'error': 'fetch failed'}
 
-    # Use the current branch's upstream tracking branch, not the repo default.
-    # This avoids false "N updates behind" alerts when the user is on a feature
-    # branch and master/main has moved forward with unrelated commits.
-    # If no upstream is set (brand-new local branch), fall back to the default branch.
-    upstream, ok = _run_git(['rev-parse', '--abbrev-ref', '@{upstream}'], path)
-    if ok and upstream:
-        # upstream is like "origin/feat/foo" — use it directly in rev-list
-        compare_ref = upstream
+    if remote == 'origin':
+        # Use the current branch's tracking branch for ordinary installations.
+        # This avoids false alerts when a feature branch intentionally diverges.
+        upstream, ok = _run_git(['rev-parse', '--abbrev-ref', '@{upstream}'], path)
+        if ok and upstream:
+            compare_ref = upstream
+        else:
+            branch = _detect_default_branch(path, remote)
+            compare_ref = f'{remote}/{branch}'
     else:
-        branch = _detect_default_branch(path)
-        compare_ref = f'origin/{branch}'
+        # A separately-selected vendor remote is explicit: compare against its
+        # default branch instead of the checked-out prod branch's origin tracker.
+        branch = _detect_default_branch(path, remote)
+        compare_ref = f'{remote}/{branch}'
 
     # Count commits behind
     out, ok = _run_git(['rev-list', '--count', f'HEAD..{compare_ref}'], path)
@@ -1182,7 +1185,7 @@ def _check_repo_branch(path, name, *, fetch=True):
     latest, _ = _run_git(['rev-parse', '--short', compare_ref], path)
 
     # Get repo URL for "What's new?" link
-    remote_url, _ = _run_git(['remote', 'get-url', 'origin'], path)
+    remote_url, _ = _run_git(['remote', 'get-url', remote], path)
     remote_url = _normalize_remote_url(remote_url)
 
     return {
@@ -1196,8 +1199,8 @@ def _check_repo_branch(path, name, *, fetch=True):
     }
 
 
-def _check_repo(path, name, channel=DEFAULT_UPDATE_CHANNEL):
-    """Check if a git repo is behind its latest release. Returns dict or None.
+def _check_repo(path, name, channel=DEFAULT_UPDATE_CHANNEL, *, check_remote='origin'):
+    """Check if a git repo is behind its selected release or branch. Returns dict or None.
 
     The returned dict (when not None) always carries a ``dirty: bool`` reflecting
     the working-tree state vs HEAD. A dirty install at-or-past the latest release
@@ -1222,6 +1225,13 @@ def _check_repo(path, name, channel=DEFAULT_UPDATE_CHANNEL):
             'behind': None,
             'no_git': True,
         }
+
+    if check_remote != 'origin':
+        branch_info = _check_repo_branch(path, name, remote=check_remote)
+        branch_info = dict(branch_info)
+        branch_info['dirty'] = _is_dirty(path)
+        branch_info['channel'] = channel
+        return branch_info
 
     # Fetch tags first so update prompts track published releases, not every
     # development commit that lands on master/main after the latest release.
@@ -1337,13 +1347,20 @@ def check_for_updates(force=False, *, include_agent=True, channel=None):
 
     try:
         # Run checks outside the lock (network I/O)
-        webui_info = _check_repo(REPO_ROOT, 'webui', channel)
-        # The update channel is a WebUI-only concept. The Agent is a separate
-        # project that tags plain v* and legitimately tracks master past its
-        # tags; it must ALWAYS use the default channel regardless of the user's
-        # WebUI channel selection. (Codex gate: passing 'experimental' here made
-        # the Agent ignore its v* tags and fall back to origin/master.)
-        agent_info = _check_repo(_AGENT_DIR, 'agent', DEFAULT_UPDATE_CHANNEL) if include_agent else _ignored_agent_update_info()
+        webui_info = _check_repo(
+            REPO_ROOT,
+            'webui',
+            channel,
+            check_remote='upstream',
+        )
+        # The update channel remains a WebUI-only setting. Keep the Agent payload
+        # channel-neutral while comparing its checkout to the vendor main branch.
+        agent_info = _check_repo(
+            _AGENT_DIR,
+            'agent',
+            DEFAULT_UPDATE_CHANNEL,
+            check_remote='upstream',
+        ) if include_agent else _ignored_agent_update_info()
 
         with _cache_lock:
             _update_cache['webui'] = webui_info
