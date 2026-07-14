@@ -175,6 +175,9 @@ def test_later_deferred_anchor_paint_updates_exact_reasoning_owner(activity_mode
     assert exact["second_before"] == "Second draft"
     assert exact["second_after"] == "Second updated"
     assert exact["legacy_after"] == "Legacy unkeyed"
+    assert exact["anchor_run_id"] == "run-5720"
+    assert exact["second_row_id"] == "run-5720:2"
+    assert exact["second_local_id"] == "live-reasoning:stream-1:2"
     assert exact["live_reasoning_rows"] == 2
     assert exact["fallback_rows"] == 0
 
@@ -548,31 +551,40 @@ function reasoningText(row){
   const pre=row.querySelector&&row.querySelector('pre');
   return pre?pre.textContent:row.textContent;
 }
-function appendSyntheticAnchorReasoningRow(rowId, text){
-  const row=_thinkingActivityNode(text, false, rowId);
-  row.setAttribute('data-anchor-scene-row','1');
-  row.setAttribute('data-anchor-row-id',rowId);
-  row.setAttribute('data-anchor-row-role','thinking');
-  row.setAttribute('data-anchor-source-event-type','reasoning');
-  row.setAttribute('data-anchor-stream-id','stream-1');
-  row.setAttribute('data-session-id','sid-1');
-  if(isTransparentStream()){
-    _decorateTransparentEventRow(row,{
-      type:'thinking',
-      text,
-      preview:text,
-      live:true,
-      segmentSeq:'2',
-      burstId:'0',
-    });
-    row.setAttribute('data-anchor-live-scene-row','1');
-    row.setAttribute('data-live-stream-owned','1');
-    turn.appendChild(row);
-  }else{
-    const group=ensureActivityGroup(turn,{activityKey:'live:stream-1'});
-    const list=_toolWorklogListEl(group);
-    (list||group||turn).appendChild(row);
-  }
+function applyProductionAnchorEvent(sourceEventType, data){
+  const registry=window._liveAnchorRegistries&&window._liveAnchorRegistries.get('stream-1');
+  if(!registry) throw new Error('missing live anchor registry');
+  window.HermesAssistantTurnAnchors.applyAssistantTurnAnchorSourceEvent(
+    registry,
+    {
+      source_event_type:sourceEventType,
+      run_id:'run-5720',
+      stream_id:'stream-1',
+      ...data,
+    },
+    {
+      session_id:'sid-1',
+      stream_id:'stream-1',
+      run_id:'run-5720',
+    }
+  );
+  return registry;
+}
+function appendProductionAnchorReasoningRow(localId, text, seq){
+  applyProductionAnchorEvent('reasoning',{
+    local_id:localId,
+    seq,
+    text,
+    activitySegmentSeq:seq,
+    activityBurstId:0,
+  });
+  window._renderLiveAnchorActivitySceneForStream('stream-1','sid-1',{
+    mode:process.env.ISSUE5720_ACTIVITY_MODE||'transparent_stream',
+  });
+  const row=anchorReasoningRows().find(candidate=>
+    candidate.getAttribute('data-anchor-row-id')===`run-5720:${seq}`
+  );
+  if(!row) throw new Error('production anchor reasoning row not rendered');
   return row;
 }
 function appendUnkeyedLegacyReasonRow(text){
@@ -610,7 +622,11 @@ if(process.env.ISSUE5720_MULTI_SEGMENT_FALLBACK==='1'){
   const firstReasoningRow=anchorReasoningRows()[0]||null;
   const firstBefore=reasoningText(firstReasoningRow);
   const secondId='live-reasoning:stream-1:2';
-  const secondReasoningRow=appendSyntheticAnchorReasoningRow(`${secondId}:reasoning:1`,'Second draft');
+  const registry=applyProductionAnchorEvent('interim_assistant',{
+    seq:1,
+    text:'',
+  });
+  const secondReasoningRow=appendProductionAnchorReasoningRow(secondId,'Second draft',2);
   const secondBefore=reasoningText(secondReasoningRow);
   const legacyRow=appendUnkeyedLegacyReasonRow('Legacy unkeyed');
   appendThinking('Second updated',{
@@ -622,10 +638,12 @@ if(process.env.ISSUE5720_MULTI_SEGMENT_FALLBACK==='1'){
     burstId:0,
   });
   multiSegmentExactFallback={
+    anchor_run_id:registry&&registry.anchor&&registry.anchor.identity&&registry.anchor.identity.run_id,
     first_row_id:firstReasoningRow&&firstReasoningRow.getAttribute('data-anchor-row-id'),
     first_before:firstBefore,
     first_after:reasoningText(firstReasoningRow),
     second_row_id:secondReasoningRow.getAttribute('data-anchor-row-id'),
+    second_local_id:secondReasoningRow.getAttribute('data-anchor-local-id'),
     second_before:secondBefore,
     second_after:reasoningText(secondReasoningRow),
     legacy_after:reasoningText(legacyRow),

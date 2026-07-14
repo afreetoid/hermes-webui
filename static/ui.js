@@ -12084,6 +12084,7 @@ function _anchorSceneNodeForRow(row, opts){
   if(!node) return null;
   node.setAttribute('data-anchor-scene-row','1');
   node.setAttribute('data-anchor-row-id',String(row.row_id||row.local_id||''));
+  if(row.local_id) node.setAttribute('data-anchor-local-id',String(row.local_id));
   node.setAttribute('data-anchor-row-role',String(row.role||'activity'));
   node.setAttribute('data-anchor-source-event-type',String(row.source_event_type||''));
   return node;
@@ -12153,6 +12154,7 @@ function _anchorSceneTransparentNodeForRow(row, opts){
   if(settled) node.setAttribute('data-anchor-settled-scene-row','1');
   if(live) node.setAttribute('data-anchor-live-scene-row','1');
   node.setAttribute('data-anchor-row-id',String(row.row_id||row.local_id||''));
+  if(row.local_id) node.setAttribute('data-anchor-local-id',String(row.local_id));
   node.setAttribute('data-anchor-row-role',String(row.role||'activity'));
   node.setAttribute('data-anchor-source-event-type',String(row.source_event_type||''));
   if(opts&&opts.streamId) node.setAttribute('data-anchor-stream-id',String(opts.streamId));
@@ -12366,18 +12368,14 @@ function _liveAnchorReasoningRowForFallback(turn, opts){
   if(!turn||!blocks||!blocks.querySelectorAll) return null;
   const streamId=String(opts.streamId||S.activeStreamId||'');
   const sessionId=String(opts.sessionId||(S.session&&S.session.session_id)||'');
-  const segmentSeq=opts.segmentSeq!==undefined&&opts.segmentSeq!==null
-    ? String(opts.segmentSeq).trim()
-    : '';
   const localId=String(opts.anchorReasoningLocalId||opts.localId||'').trim();
-  const rowKey=localId||(streamId&&segmentSeq?`live-reasoning:${streamId}:${segmentSeq}`:'');
-  if(!rowKey) return null;
+  if(!localId) return null;
   const rows=blocks.querySelectorAll(
-    '[data-anchor-scene-row="1"][data-anchor-row-id]'
+    '[data-anchor-scene-row="1"][data-anchor-local-id]'
   );
   for(const row of Array.from(rows)){
-    const anchorRowId=String(row.getAttribute&&row.getAttribute('data-anchor-row-id')||'');
-    if(anchorRowId!==rowKey&&!anchorRowId.startsWith(`${rowKey}:`)) continue;
+    const anchorLocalId=String(row.getAttribute&&row.getAttribute('data-anchor-local-id')||'');
+    if(anchorLocalId!==localId) continue;
     const rowRole=String(row.getAttribute&&row.getAttribute('data-anchor-row-role')||'');
     const rowSource=String(row.getAttribute&&row.getAttribute('data-anchor-source-event-type')||'');
     if(rowRole!=='thinking'&&rowSource!=='reasoning') continue;
