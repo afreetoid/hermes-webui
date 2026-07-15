@@ -14666,15 +14666,24 @@ def handle_post(handler, parsed) -> bool:
             logger.debug("Failed to close workspace terminal for deleted session %s", sid)
         # Also delete from CLI state.db for CLI sessions shown in sidebar,
         # but never erase external messaging channel memory via WebUI delete.
+        state_db_cleanup_failed = False
         if not is_messaging_session:
             try:
                 from api.models import delete_cli_session
 
-                delete_cli_session(sid)
+                state_db_cleanup_failed = not delete_cli_session(sid)
             except Exception:
-                logger.debug("Failed to delete CLI session %s", sid)
+                state_db_cleanup_failed = True
+                logger.warning("Failed to delete CLI session %s", sid, exc_info=True)
         _publish_session_list_changed("session_delete", profile=event_profile)
-        return j(handler, {"ok": True, **worktree_retained})
+        return j(
+            handler,
+            {
+                "ok": True,
+                "state_db_cleanup_failed": state_db_cleanup_failed,
+                **worktree_retained,
+            },
+        )
 
     if parsed.path == "/api/session/clear":
         try:
